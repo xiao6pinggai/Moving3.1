@@ -44,7 +44,10 @@ class CtdetLoss(torch.nn.Module):
         except:
             b,c,t,h,w = output['hm_large_heatmap'].shape
         if self.opt.hm_large_heatmap_flag:
-            output['hm_large_heatmap'] = _sigmoid(output['hm_large_heatmap'])
+            hm_large_pred = output['hm_large_heatmap']
+            if hm_large_pred.shape[1] > 1:
+                hm_large_pred = hm_large_pred.mean(dim=1, keepdim=True)
+            output['hm_large_heatmap'] = _sigmoid(hm_large_pred)
             hm_large_target = batch['hm_large_heatmap']
             if hm_large_target.shape[2:] != output['hm_large_heatmap'].shape[2:]:
                 hm_large_target = F.interpolate(

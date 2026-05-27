@@ -88,7 +88,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
         elif net1name=='UNet3DWithNormalConv3D':
             self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True,TConvOnly=True)
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False,TConvOnly=True)
         elif net1name=='UNet2DWithNormalConv2D':
             self.I2PNet = UNet2DWithNormalConv2D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True)
@@ -118,25 +118,28 @@ class Img2PointsSmallObjectDetection(nn.Module):
         self.sigmoid = nn.Sigmoid()
         # 稀疏
         self.thresh=thresh
+        self.net1_feature_channels = input_channels
+        if net1name == 'UNet3DWithNormalConv3D':
+            self.net1_feature_channels = feat_channels[0]
         head_conv=128
         grid_size = np.array([image_size[1], image_size[0], img_num - 1])
         self.points_all = img_num*image_size[0]*image_size[1]
         if  layers==4:
-            self.sp_backbone = UNetV2(input_channels, grid_size)
+            self.sp_backbone = UNetV2(self.net1_feature_channels, grid_size)
         elif layers==3:
-            self.sp_backbone = UNetV2_3(input_channels, grid_size)
+            self.sp_backbone = UNetV2_3(self.net1_feature_channels, grid_size)
         elif layers == 2:
-            self.sp_backbone = UNetV2_2(input_channels, grid_size)
+            self.sp_backbone = UNetV2_2(self.net1_feature_channels, grid_size)
         elif layers == 3.5:
-            self.sp_backbone = UNetV2_3_32(input_channels, grid_size)
+            self.sp_backbone = UNetV2_3_32(self.net1_feature_channels, grid_size)
         elif layers == 3.6:
-            self.sp_backbone = UNetV2_3_T_nodown(input_channels, grid_size)
+            self.sp_backbone = UNetV2_3_T_nodown(self.net1_feature_channels, grid_size)
         elif layers == 3.61:
-            self.sp_backbone = UNetV2_3_T_nodown_v2(input_channels, grid_size)  
+            self.sp_backbone = UNetV2_3_T_nodown_v2(self.net1_feature_channels, grid_size)  
         elif layers == 3.62:
-            self.sp_backbone = UNetV2_3_T_nodown_v3(input_channels, grid_size)  
+            self.sp_backbone = UNetV2_3_T_nodown_v3(self.net1_feature_channels, grid_size)  
         elif layers == 3.7:
-            self.sp_backbone = UNetV2_3_T_nodown_maxpool(input_channels, grid_size)
+            self.sp_backbone = UNetV2_3_T_nodown_maxpool(self.net1_feature_channels, grid_size)
         else:
             raise Exception('Not a valid mode!!!!!')
         head_input_channel = self.sp_backbone.num_point_features
@@ -310,18 +313,22 @@ class Img2PointsSmallObjectDetection(nn.Module):
         ##########################################################################
 
         if isinstance(net1_output, dict):
-            voxel_features_ori = net1_output['proposal_logits'].clone()
             voxel_features = net1_output['proposal_logits']
             if voxel_features.shape[2:] != (t, h, w):
                 voxel_features = F.interpolate(
                     voxel_features, size=(t, h, w), mode='trilinear', align_corners=True
                 )
+            voxel_features_ori = voxel_features.clone()
         else:
             voxel_features = net1_output
             voxel_features_ori = voxel_features.clone()
 
+        voxel_score_logits = voxel_features
+        if voxel_score_logits.shape[1] > 1:
+            voxel_score_logits = voxel_score_logits.mean(dim=1, keepdim=True)
+
         # print(f"net1运行完毕：\n\t",torch.cuda.memory_summary(device, abbreviated=True))  # abbreviated=True 简化输出
-        soft_mask = self.sigmoid(voxel_features) # B 1 T H W
+        soft_mask = self.sigmoid(voxel_score_logits) # B 1 T H W
 
         # 核心：基于均值+方差卡阈值，且保证每帧有效点数≥50
         binary_mask = self.get_mask_by_mean_std( # b 1 T h w -->0/1.0
@@ -371,7 +378,9 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
         # ====================== 修改：索引拼接后的4通道特征 ======================
         # 展平为 [B*T*H*W, 4]，再通过flattened_indices索引，得到 [N,4] 的点云特征（N是有效点数）
-        batch_dict['voxel_features'] = voxel_features.reshape(b*t*h*w, 1)[flattened_indices]  # 核心修改2
+        voxel_feature_channels = voxel_features.shape[1]
+        voxel_features_flat = voxel_features.permute(0, 2, 3, 4, 1).reshape(b * t * h * w, voxel_feature_channels)
+        batch_dict['voxel_features'] = voxel_features_flat[flattened_indices]  # 核心修改2
         batch_dict['voxel_coords'] = coords.to(device)
         batch_dict['batch_size'] = b
         if coords.shape[0] == 0:
