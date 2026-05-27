@@ -621,10 +621,9 @@ class UNet3DWithNormalConv3D(Module):
         self.upsample2 = Upsample3D_Block(feat_channels[2], feat_channels[1], mode=upsample_mode, T_upsample=T_pooling)
         self.upsample1 = Upsample3D_Block(feat_channels[1], feat_channels[0], mode=upsample_mode, T_upsample=T_pooling)
 
-        # 最终分割头
-        self.final_conv = Conv3d(feat_channels[0], num_classes, kernel_size=1, stride=1, padding=0, bias=True)
-        # 多通道输出头：在 use_final_conv=False 时保留通道数，同时让通道均值具备低先验概率
-        self.feature_final_conv = Conv3d(feat_channels[0], feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+        # 最终输出头。use_final_conv=True 时输出 num_classes，False 时保留多通道特征。
+        final_out_channels = num_classes if use_final_conv else feat_channels[0]
+        self.final_conv = Conv3d(feat_channels[0], final_out_channels, kernel_size=1, stride=1, padding=0, bias=True)
         ######################################输出概率重置#######################################
         # 1. 设定先验概率 pi，通常取 0.01
         prior_prob = 0.01
@@ -632,21 +631,20 @@ class UNet3DWithNormalConv3D(Module):
         # 2. 计算对应的 bias 值
         # logit = log(pi / (1 - pi)) = -log((1 - pi) / pi)
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        
-        # 3. 初始化 Bias
-        # 这会让网络初始输出的概率图全图接近 0.01，Loss 从很小开始，而不是从 5.0 开始
-        self.final_conv.bias.data.fill_(bias_value)
-        
-        # 4. 初始化 Weight
+
+        # 3. 初始化 Weight
         # 权重必须初始化为很小的高斯分布，确保 bias 占主导地位
         self.final_conv.weight.data.normal_(0, 0.01)
 
-        # use_final_conv=False 时，仍然让多通道输出的通道均值具备相同先验，
-        # 但各通道保持轻微差异，避免完全相同的初始化。
-        self.feature_final_conv.weight.data.normal_(0, 0.01)
-        channel_bias_noise = torch.randn(feat_channels[0]) * 0.1
-        channel_bias_noise = channel_bias_noise - channel_bias_noise.mean()
-        self.feature_final_conv.bias.data.copy_(bias_value + channel_bias_noise)
+        if use_final_conv:
+            # 单通道/类别输出沿用原来的低先验初始化。
+            self.final_conv.bias.data.fill_(bias_value)
+        else:
+            # 多通道输出时，让通道均值具备相同低先验，
+            # 但各通道保持轻微差异，避免完全相同的初始化。
+            channel_bias_noise = torch.randn(final_out_channels) * 0.1
+            channel_bias_noise = channel_bias_noise - channel_bias_noise.mean()
+            self.final_conv.bias.data.copy_(bias_value + channel_bias_noise)
         ######################################输出概率重置#######################################
         self.sigmoid = Sigmoid()
 
@@ -702,10 +700,7 @@ class UNet3DWithNormalConv3D(Module):
             # del enc1
             tmp = self.dec_conv1(tmp)
 
-            if self.use_final_conv:
-                tmp = self.final_conv(tmp)
-            else:
-                tmp = self.feature_final_conv(tmp)
+            tmp = self.final_conv(tmp)
             if self.activation == 'sigmoid':
                 tmp = self.sigmoid(tmp)
             return tmp
@@ -736,10 +731,7 @@ class UNet3DWithNormalConv3D(Module):
             # del enc1
             tmp = self.dec_conv1(tmp)
 
-            if self.use_final_conv:
-                tmp = self.final_conv(tmp)
-            else:
-                tmp = self.feature_final_conv(tmp)
+            tmp = self.final_conv(tmp)
             if self.activation == 'sigmoid':
                 tmp = self.sigmoid(tmp)
             return tmp
