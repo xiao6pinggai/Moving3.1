@@ -1,0 +1,11 @@
+weights/
+.vscode/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+password
+password.pub
+ssh-copy-id -p 46267 root@connect.cqa1.seetacloud.com
+ssh-copy-id -p 46267 root@connect.cqa1.seetacloud.com.pub
+tmp_cq666_authorized_keys
+tmp_cq666_authorized_keys_fixed
