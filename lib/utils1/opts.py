@@ -11,10 +11,10 @@ class opts(object):
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         # basic experiment setting
-        self.parser.add_argument('--discribe', default='[SGNet_3D_3x1x1_8_16_32_64_womfe]317反比增强，alpha=0.5，随机数种子317,cosmatch设置dialtion=2，不填充0，I2PSOD 10帧 net1三层次下采样T保持，全部为标准卷积,net1损失修改为:hm半径为HW,sigma/3,kt=3,均包含瓶颈层,融合简化，减少中间层,net1outonly') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享，
+        self.parser.add_argument('--discribe', default='[SGNet_3D_4_8_16_32_wmfe_[41 21 11]]主要是因为mfe是对称的范围，21的话只能看到10*10的窗口') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享，
         self.parser.add_argument('--task', default='ctdet_points',
                                  help='task name.  ctdet_points |  ctdet ')
-        self.parser.add_argument('--exp_name', default='SGNet_3D_3x1x1_8_16_32_64_womfe', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
+        self.parser.add_argument('--exp_name', default='SGNet_3D_4_8_16_32_[41 21 11]', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3
         self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # 修改3
@@ -108,12 +108,12 @@ class opts(object):
         self.parser.add_argument('--stage1_epochs', type=int, default=10, help='number of epochs for stage 1 training.')
         
         # net1 define
-        self.parser.add_argument('--feat_channels', type=list, default=[8,16,32,64], help='unet upsample channels') # [8,16,32,64] for Unet3DWithNormalConv3D # [8,16,32,16,8] for LightWeightedConv3D
+        self.parser.add_argument('--feat_channels', type=list, default=[4,8,16,32], help='unet upsample channels') # [8,16,32,64] for Unet3DWithNormalConv3D # [8,16,32,16,8] for LightWeightedConv3D
         self.parser.add_argument('--input_channels', type=int, default=1, help='how many channles feature input net2')
         self.parser.add_argument('--T_pooling', type=bool, default=False,  help='is pooling t dim or not')
         self.parser.add_argument('--groups', type=int, default=-1, help='net1 conv groups(must be feat_channels % == 0)')
         self.parser.add_argument('--downsample_mode', type=str, default='maxpool', help='downsample mode "stride" or "maxpool"')
-        self.parser.add_argument('--net1name', type=str, default='UNet2DWithNormalConv2D', help='encoder use ATDC') # LightWeightedConv3D  # UNet3DWithNormalConv3D
+        self.parser.add_argument('--net1name', type=str, default='UNet3DWithNormalConv3D', help='encoder use ATDC') # LightWeightedConv3D  # UNet3DWithNormalConv3D
         #可视化
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
         self.parser.add_argument('--vis_mode', type=str, default='mean', help='feature map aggregation mode: mean / max / channel index (e.g. 0 1 2)')
@@ -138,7 +138,7 @@ class opts(object):
             opt.batch_size= 8
         if opt.seqLen == 10:
             opt.data_sampling = 5
-            opt.batch_size= 16  # 默认8
+            opt.batch_size= 4  # 默认8
             if opt.thresh == 1:
                 opt.batch_size= 2
                 opt.data_sampling = 30

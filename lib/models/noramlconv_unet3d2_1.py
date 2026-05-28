@@ -463,12 +463,14 @@ class UNet2DWithNormalConv2D(Module):
         self.upsample2 = Upsample2D_Block(feat_channels[2], feat_channels[1], mode=upsample_mode)
         self.upsample1 = Upsample2D_Block(feat_channels[1], feat_channels[0], mode=upsample_mode)
 
-        self.final_conv = Conv2d(feat_channels[0], num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv2d(feat_channels[0], num_classes, kernel_size=1, stride=1, padding=0, bias=True)
 
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        self.final_conv.bias.data.fill_(bias_value)
-        self.final_conv.weight.data.normal_(0, 0.01)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.final_conv.bias.data.fill_(bias_value)
+            self.final_conv.weight.data.normal_(0, 0.01)
 
         self.sigmoid = Sigmoid()
 
@@ -506,7 +508,7 @@ class UNet2DWithNormalConv2D(Module):
 
             if self.use_final_conv:
                 tmp = self.final_conv(tmp)
-            if self.activation == 'sigmoid':
+            if self.use_final_conv and self.activation == 'sigmoid':
                 tmp = self.sigmoid(tmp)
             return tmp
 
@@ -529,7 +531,7 @@ class UNet2DWithNormalConv2D(Module):
 
             if self.use_final_conv:
                 tmp = self.final_conv(tmp)
-            if self.activation == 'sigmoid':
+            if self.use_final_conv and self.activation == 'sigmoid':
                 tmp = self.sigmoid(tmp)
             return tmp
 
@@ -621,31 +623,22 @@ class UNet3DWithNormalConv3D(Module):
         self.upsample2 = Upsample3D_Block(feat_channels[2], feat_channels[1], mode=upsample_mode, T_upsample=T_pooling)
         self.upsample1 = Upsample3D_Block(feat_channels[1], feat_channels[0], mode=upsample_mode, T_upsample=T_pooling)
 
-        # 最终输出头。use_final_conv=True 时输出 num_classes，False 时保留多通道特征。
-        final_out_channels = num_classes if use_final_conv else feat_channels[0]
-        self.final_conv = Conv3d(feat_channels[0], final_out_channels, kernel_size=1, stride=1, padding=0, bias=True)
-        ######################################输出概率重置#######################################
-        # 1. 设定先验概率 pi，通常取 0.01
-        prior_prob = 0.01
-        
-        # 2. 计算对应的 bias 值
-        # logit = log(pi / (1 - pi)) = -log((1 - pi) / pi)
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv3d(feat_channels[0], feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+            ######################################输出概率重置#######################################
+            # 1. 设定先验概率 pi，通常取 0.01
+            prior_prob = 0.01
+            
+            # 2. 计算对应的 bias 值
+            # logit = log(pi / (1 - pi)) = -log((1 - pi) / pi)
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
 
-        # 3. 初始化 Weight
-        # 权重必须初始化为很小的高斯分布，确保 bias 占主导地位
-        self.final_conv.weight.data.normal_(0, 0.01)
-
-        if use_final_conv:
-            # 单通道/类别输出沿用原来的低先验初始化。
+            # 3. 初始化 Weight
+            # 权重必须初始化为很小的高斯分布，确保 bias 占主导地位
+            self.final_conv.weight.data.normal_(0, 0.01)
             self.final_conv.bias.data.fill_(bias_value)
-        else:
-            # 多通道输出时，让通道均值具备相同低先验，
-            # 但各通道保持轻微差异，避免完全相同的初始化。
-            channel_bias_noise = torch.randn(final_out_channels) * 0.1
-            channel_bias_noise = channel_bias_noise - channel_bias_noise.mean()
-            self.final_conv.bias.data.copy_(bias_value + channel_bias_noise)
-        ######################################输出概率重置#######################################
+            ######################################输出概率重置#######################################
         self.sigmoid = Sigmoid()
 
     def _align_feature_size(self, x, ref_tensor):
@@ -700,8 +693,9 @@ class UNet3DWithNormalConv3D(Module):
             # del enc1
             tmp = self.dec_conv1(tmp)
 
-            tmp = self.final_conv(tmp)
-            if self.activation == 'sigmoid':
+            if self.use_final_conv:
+                tmp = self.final_conv(tmp)
+            if self.use_final_conv and self.activation == 'sigmoid':
                 tmp = self.sigmoid(tmp)
             return tmp
 
@@ -731,8 +725,9 @@ class UNet3DWithNormalConv3D(Module):
             # del enc1
             tmp = self.dec_conv1(tmp)
 
-            tmp = self.final_conv(tmp)
-            if self.activation == 'sigmoid':
+            if self.use_final_conv:
+                tmp = self.final_conv(tmp)
+            if self.use_final_conv and self.activation == 'sigmoid':
                 tmp = self.sigmoid(tmp)
             return tmp
 
@@ -801,12 +796,14 @@ class EncoderOnlyConv3DProposalNet(Module):
             if idx < len(feat_channels) - 1:
                 self.down_blocks.append(build_downsample_layer(out_channels))
 
-        self.proposal_head = Conv3d(in_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+        self.proposal_head = None
+        if self.use_final_conv:
+            self.proposal_head = Conv3d(in_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
 
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        self.proposal_head.bias.data.fill_(bias_value)
-        self.proposal_head.weight.data.normal_(0, 0.01)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.proposal_head.bias.data.fill_(bias_value)
+            self.proposal_head.weight.data.normal_(0, 0.01)
 
         self.sigmoid = Sigmoid()
 
@@ -818,7 +815,7 @@ class EncoderOnlyConv3DProposalNet(Module):
                 tmp = self.down_blocks[idx](tmp)
 
         proposal_logits = self.proposal_head(tmp) if self.use_final_conv else tmp
-        if self.activation == 'sigmoid':
+        if self.use_final_conv and self.activation == 'sigmoid':
             proposal_logits = self.sigmoid(proposal_logits)
 
         return {
@@ -860,12 +857,14 @@ class LightWeightedConv3D(Module):
             in_channels = out_channels
         self.conv_blocks = nn.ModuleList(conv_blocks)
 
-        self.final_conv = Conv3d(in_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv3d(in_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
 
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        self.final_conv.bias.data.fill_(bias_value)
-        self.final_conv.weight.data.normal_(0, 0.01)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.final_conv.bias.data.fill_(bias_value)
+            self.final_conv.weight.data.normal_(0, 0.01)
 
         self.sigmoid = Sigmoid()
 
@@ -876,7 +875,7 @@ class LightWeightedConv3D(Module):
 
         if self.use_final_conv:
             tmp = self.final_conv(tmp)
-        if self.activation == 'sigmoid':
+        if self.use_final_conv and self.activation == 'sigmoid':
             tmp = self.sigmoid(tmp)
         return tmp
 

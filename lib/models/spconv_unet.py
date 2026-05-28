@@ -1223,12 +1223,12 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
 
         # mfe # V2!!!
-        # self.sptial2d1 = block(16, 16, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm1_1') # 2d
-        # self.sptial2d2 = block(32, 32, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm2_2')
-        # self.sptial2d3 = block(64, 64, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm3_3')
-        # self.shortcut1 = SparseSymmetricCosineAttention(in_channels=16, kernel_size=21, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d1)
-        # self.shortcut2 = SparseSymmetricCosineAttention(in_channels=32, kernel_size=15, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d2)
-        # self.shortcut3 = SparseSymmetricCosineAttention(in_channels=64, kernel_size=9, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d3)
+        self.sptial2d1 = block(16, 16, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm1_1') # 2d
+        self.sptial2d2 = block(32, 32, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm2_2')
+        self.sptial2d3 = block(64, 64, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm3_3')
+        self.shortcut1 = SparseSymmetricCosineAttention(in_channels=16, kernel_size=41, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d1)
+        self.shortcut2 = SparseSymmetricCosineAttention(in_channels=32, kernel_size=21, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d2)
+        self.shortcut3 = SparseSymmetricCosineAttention(in_channels=64, kernel_size=11, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d3)
         # mfe
         
         
@@ -1238,9 +1238,9 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
 
         # mfe
-        # self.shortcut1fusion = GroupedDilatedBlock(16, 16, 3, dilations=[1, 2, 3,4], indice_key='subm1')
-        # self.shortcut2fusion = GroupedDilatedBlock(32, 32, 3, dilations=[1, 2, 3,4], indice_key='subm2')
-        # self.shortcut3fusion = GroupedDilatedBlock(64, 64, 3, dilations=[1, 2, 3,4], indice_key='subm3')
+        self.shortcut1fusion = GroupedDilatedBlock(16, 16, 3, dilations=[1, 2, 3,4], indice_key='subm1')
+        self.shortcut2fusion = GroupedDilatedBlock(32, 32, 3, dilations=[1, 2, 3,4], indice_key='subm2')
+        self.shortcut3fusion = GroupedDilatedBlock(64, 64, 3, dilations=[1, 2, 3,4], indice_key='subm3')
         # mfe
 
 
@@ -1353,20 +1353,20 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
         # w/o shortcut process
         # x_conv3 = self.se3(x_conv3)
-        # x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
-        # x_conv3 = self.shortcut3fusion(x_conv3)
+        x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
+        x_conv3 = self.shortcut3fusion(x_conv3)
         x_up3 = self.UR_block_forward(x_conv3, x_bottle, self.conv_up_t3, self.conv_up_m3, self.inv_conv3)
         # [1600, 1408, 41] <- [800, 704, 21]
         # w/o shortcut process
         # x_conv2 = self.se2(x_conv2)
-        # x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
-        # x_conv2 = self.shortcut2fusion(x_conv2)
+        x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
+        x_conv2 = self.shortcut2fusion(x_conv2)
         x_up2 = self.UR_block_forward(x_conv2, x_up3, self.conv_up_t2, self.conv_up_m2, self.inv_conv2)
         # [1600, 1408, 41] <- [1600, 1408, 41]
         # w/o shortcut process
         # x_conv1 = self.se1(x_conv1)
-        # x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
-        # x_conv1 = self.shortcut1fusion(x_conv1)
+        x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
+        x_conv1 = self.shortcut1fusion(x_conv1)
         x_up1 = self.UR_block_forward(x_conv1, x_up2, self.conv_up_t1, self.conv_up_m1, self.conv5)
 
         batch_dict['point_features'] = x_up1

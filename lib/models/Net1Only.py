@@ -84,10 +84,10 @@ class Net1Only(nn.Module):
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
         elif net1name=='UNet3DWithNormalConv3D': # 实际使用
             self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False,TConvOnly=True)
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False,TConvOnly=False)
         elif net1name=='UNet2DWithNormalConv2D':
             self.I2PNet = UNet2DWithNormalConv2D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False)
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False, TConvOnly=False)
         elif net1name=='LightWeightedConv3D':
             self.I2PNet = LightWeightedConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False)
@@ -113,7 +113,7 @@ class Net1Only(nn.Module):
         
         head_conv=128
         
-        head_input_channel = 8
+        head_input_channel = feat_channels[0]
         # 32 1 可以训练
         ###get head conv
         self.heads = heads
