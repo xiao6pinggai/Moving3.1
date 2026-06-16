@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 from functools import partial
 import numpy as np
-import sys
-ROOT_DIR = "/root/autodl-tmp/Moving3.1"
-# 确保根目录在sys.path首位（覆盖默认的子目录）
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+import sys, os
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
 from lib.models.spconv_unet import UNetV2, UNetV2_3, UNetV2_2
 from lib.models.spconv_utils import replace_feature, spconv
 

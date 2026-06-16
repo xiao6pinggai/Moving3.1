@@ -1,10 +1,20 @@
 import math
 import time
-import warnings
+import warnings, sys, os
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import Module, Sequential, Conv2d, Conv3d, ConvTranspose2d, ConvTranspose3d, BatchNorm2d, BatchNorm3d, MaxPool2d, MaxPool3d, ReLU, Sigmoid
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
+from lib.models.TOSConv import TOSConv
+from lib.models.TOSConv_once_conv_masked import TOSConv_once_conv_masked
+from lib.models.TZSLinear import TZSLinear
+from lib.models.DynamicTOSConv import DynamicTOSConv
 
 # ==========================================
 # 基础组件定义
@@ -859,7 +869,7 @@ class LightWeightedConv3D(Module):
 
         self.final_conv = None
         if self.use_final_conv:
-            self.final_conv = Conv3d(in_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            self.final_conv = Conv3d(in_channels, feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
 
             prior_prob = 0.01
             bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -880,11 +890,182 @@ class LightWeightedConv3D(Module):
         return tmp
 
 
-            
+class TOSConvNet(Module):
+    """3x3x3 Conv-BN-ReLU stack with an optional temporal sum-one background branch."""
 
-# ==========================================
-# 测试代码 (计算 FLOPs 和 Params)
-# ==========================================
+    def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
+                 residual=None, upsample_mode="trilinear", dropout_prob=0,
+                 activation=None, T_pooling=True, groups=2,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv=True,
+                 seq_len=10):
+        super().__init__()
+        self.use_final_conv = use_final_conv
+        self.use_tzsconv = use_tzsconv
+        stages = []
+
+        self.background_conv = None
+        if self.use_tzsconv:
+            self.background_conv = TOSConv(
+                num_channels,
+                num_channels,
+                kernel_size=(seq_len, 1, 1),
+                stride=1,
+                padding=(0, 0, 0),
+                bias=False,
+                skip_add=False,
+                groups=num_channels
+            )
+        in_channels = num_channels
+        for stage_idx, out_channels in enumerate(feat_channels):
+            stage_in_channels = in_channels
+            if self.use_tzsconv and stage_idx == 0:
+                stage_in_channels = in_channels * 2
+            stages.append(nn.Sequential(
+                Conv3d(stage_in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                BatchNorm3d(out_channels),
+                ReLU(inplace=True),
+            ))
+            in_channels = out_channels
+        self.stages = nn.ModuleList(stages)
+
+        
+
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv3d(in_channels, feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.final_conv.weight.data.normal_(0, 0.01)
+            self.final_conv.bias.data.fill_(bias_value)
+
+    def forward(self, x):
+        for stage_idx, stage in enumerate(self.stages):
+            if self.background_conv is not None and stage_idx == 0:
+                background = self.background_conv(x)
+                foreground = x - background
+                x = torch.cat([x, foreground], dim=1)
+            x = stage(x)
+        if self.final_conv is not None:
+            x = self.final_conv(x)
+        return x
+
+
+class TZSConvNet(Module):
+    """3x3x3 Conv-BN-ReLU stack with an optional temporal zero-sum foreground branch."""
+
+    def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
+                 residual=None, upsample_mode="trilinear", dropout_prob=0,
+                 activation=None, T_pooling=True, groups=2,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv=True,
+                 seq_len=10):
+        super().__init__()
+        self.use_final_conv = use_final_conv
+        self.use_tzsconv = use_tzsconv
+
+        stages = []
+
+        self.forward_conv = None
+        if self.use_tzsconv:
+            self.forward_conv = TZSLinear(
+                num_channels,
+                num_channels,
+                kernel_size=(seq_len, 1, 1),
+                stride=1,
+                padding=0,
+                bias=True,
+                skip_add=False,
+                groups=num_channels
+            )
+        in_channels = num_channels
+        for stage_idx, out_channels in enumerate(feat_channels):
+            stage_in_channels = in_channels
+            if self.use_tzsconv and stage_idx == 0:
+                stage_in_channels = in_channels * 2
+            stages.append(nn.Sequential(
+                Conv3d(stage_in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                BatchNorm3d(out_channels),
+                ReLU(inplace=True),
+            ))
+            in_channels = out_channels
+        self.stages = nn.ModuleList(stages)
+
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv3d(in_channels, feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.final_conv.weight.data.normal_(0, 0.01)
+            self.final_conv.bias.data.fill_(bias_value)
+
+    def forward(self, x):
+        for stage_idx, stage in enumerate(self.stages):
+            if self.forward_conv is not None and stage_idx == 0:
+                foreground = self.forward_conv(x)
+                x = torch.cat([x, foreground], dim=1)
+            x = stage(x)
+        if self.final_conv is not None:
+            x = self.final_conv(x)
+        return x
+
+
+class DynamicTOSConvNet(Module):
+    """3x3x3 Conv-BN-ReLU stack with an optional dynamic temporal background branch."""
+
+    def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
+                 residual=None, upsample_mode="trilinear", dropout_prob=0,
+                 activation=None, T_pooling=True, groups=2,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv=True,
+                 seq_len=10):
+        super().__init__()
+        self.use_final_conv = use_final_conv
+        self.use_tzsconv = use_tzsconv
+
+        stages = []
+
+        self.background_conv = None
+        if self.use_tzsconv:
+            self.background_conv = DynamicTOSConv(
+                num_channels,
+                num_channels,
+                kernel_size=(seq_len, 1, 1),
+                stride=1,
+                padding=0,
+                bias=False,
+                skip_add=False,
+                groups=num_channels
+            )
+        in_channels = num_channels
+        for stage_idx, out_channels in enumerate(feat_channels):
+            stage_in_channels = in_channels
+            if self.use_tzsconv and stage_idx == 0:
+                stage_in_channels = in_channels * 2
+            stages.append(nn.Sequential(
+                Conv3d(stage_in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                BatchNorm3d(out_channels),
+                ReLU(inplace=True),
+            ))
+            in_channels = out_channels
+        self.stages = nn.ModuleList(stages)
+
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv3d(in_channels, feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.final_conv.weight.data.normal_(0, 0.01)
+            self.final_conv.bias.data.fill_(bias_value)
+
+    def forward(self, x):
+        for stage_idx, stage in enumerate(self.stages):
+            if self.background_conv is not None and stage_idx == 0:
+                background = self.background_conv(x)
+                foreground = x - background
+                x = torch.cat([x, foreground], dim=1)
+            x = stage(x)
+        if self.final_conv is not None:
+            x = self.final_conv(x)
+        return x
+
 if __name__ == '__main__':
     try:
         from thop import profile
@@ -896,7 +1077,7 @@ if __name__ == '__main__':
     print(f"使用设备: {device}")
     
     # 模拟输入：Batch=1, C=3, D=8, H=128, W=128 (适当减小尺寸以加快测试)
-    input_tensor = torch.randn(1, 3, 10, 256, 256).to(device)
+    input_tensor = torch.randn(1, 3, 10, 1024, 1024).to(device)
 
     # 4种情况测试
     configs = [
@@ -910,13 +1091,12 @@ if __name__ == '__main__':
     print("-" * 65)
 
     for cfg in configs:
-        model = UNet3DWithNormalConv3D(
+        model = TOSConvNet( # UNet3DWithNormalConv3D
             num_channels=3,
-            feat_channels=[16, 32, 64, 128], # 轻量化通道用于测试
+            feat_channels=[16, 16, 16], # 轻量化通道用于测试
             upsample_mode="trilinear",
             T_pooling=cfg["T_pooling"],
             downsample_mode=cfg["mode"],
-            
         ).to(device).eval()
 
         # 运行一次检查输出尺寸

@@ -4,109 +4,54 @@ from functools import partial
 import numpy as np
 import os, sys
 
-ROOT_DIR = "/root/autodl-tmp/Moving3.1"
-# 确保根目录在sys.path首位（覆盖默认的子目录）
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
 
 
-from lib.models.noramlconv_unet3d10 import UNet3DCatATDC
-from lib.models.noramlconv_unet3d9 import UNet3DAddATDC
 from lib.utils1.enlarge_mask import dilate_mask_fast
 from lib.utils1.bbox2binarymask import bboxes_to_binary_mask
 
-# 验证是否生效
-# print("修正后的sys.path:", sys.path[:3])
 from lib.models.spconv_unet import UNetV2, UNetV2_3, UNetV2_2, UNetV2_3_32, UNetV2_3_T_nodown, UNetV2_3_T_nodown_maxpool, UNetV2_3_T_nodown_v2, UNetV2_3_T_nodown_v3
 from lib.models.spconv_utils import replace_feature, spconv
-from lib.models.noramlconv_unet3d2 import UNet3D, UNet3DATDC
-from lib.models.noramlconv_unet3d0_1 import UNet3DGroupDilation4Branch
-from lib.models.noramlconv_unet3d3 import UNet3DATDCDilation
-from lib.models.noramlconv_unet3d4 import UNet3DZSTA
-from lib.models.noramlconv_unet3d5 import UNet3DTAM
-from lib.models.noramlconv_unet3d6 import UNet3DGroupATDCDilation
-from lib.models.noramlconv_unet3d8 import UNet3DGroupATDCDilation4Branch
-from lib.models.noramlconv_unet3d9 import UNet3DAddATDC
-from lib.models.noramlconv_unet3d11 import UNet3DwithZZLB
-from lib.models.noramlconv_unet3d12 import UNet3DWithATDCDilation2
-from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D
-from lib.models.noramlconv_unet3d_3branch import UNet3DWithNormalConv3D3Branch
-from lib.models.noramlconv_unet3d_3branchDilation import UNet3DWithGroupedMultiBranch
-from lib.models.noramlconv_unet3dcsam import UNet3DWithNormalConv3DCSAM
-from lib.models.noramlconv_unet3patdc import UNet3DWithNormalConv3DPATDC
-
-from lib.models.noramlconv_unet3patdc_split import UNet3DWithNormalConv3DPATDCSplit
+from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D, TOSConvNet, TZSConvNet, DynamicTOSConvNet
 from lib.utils1.show_one_img import show_one_img
 import torch
 
 class Net1Only(nn.Module):
     def __init__(self, heads, image_size = [512,512], img_num = 20, layers = 3, thresh=None, input_channels=1, 
                  feat_channels=[16,32,64,128], T_pooling=False,groups=1,downsample_mode='stride',
-                 net1name='UNet3DWithNormalConv3D'):
+                 net1name='UNet3DWithNormalConv3D', opt=None):
         super().__init__()
         # points generate net
         self.net1name=net1name
-        if net1name=='UNet3DATDC':
-                self.I2PNet = UNet3DATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DATDCDilation':
-                self.I2PNet = UNet3DATDCDilation(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3D': 
-            self.I2PNet = UNet3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DZSTA':
-            self.I2PNet = UNet3DZSTA(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DTAM':
-            self.I2PNet = UNet3DTAM(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DGroupATDCDilation':
-            self.I2PNet = UNet3DGroupATDCDilation(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DGroupATDCDilation4Branch':
-            self.I2PNet = UNet3DGroupATDCDilation4Branch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DGroupDilation4Branch': # 验证时域金字塔的作用
-            self.I2PNet = UNet3DGroupDilation4Branch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DAddATDC': 
-            self.I2PNet = UNet3DAddATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DCatATDC': 
-            self.I2PNet = UNet3DCatATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)  
-        elif net1name=='UNet3DwithZZLB':
-            self.I2PNet = UNet3DwithZZLB(num_channels=4, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithATDCDilation2':
-            self.I2PNet = UNet3DWithATDCDilation2(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithNormalConv3D': # 实际使用
-            self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
+        if net1name=='UNet3DWithNormalConv3D': # 实际使用
+            self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False,TConvOnly=False)
         elif net1name=='UNet2DWithNormalConv2D':
-            self.I2PNet = UNet2DWithNormalConv2D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
+            self.I2PNet = UNet2DWithNormalConv2D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False, TConvOnly=False)
         elif net1name=='LightWeightedConv3D':
-            self.I2PNet = LightWeightedConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
+            self.I2PNet = LightWeightedConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False)
-
-        elif net1name=='UNet3DWithNormalConv3D3Branch':
-            self.I2PNet = UNet3DWithNormalConv3D3Branch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithGroupedMultiBranch':
-            self.I2PNet = UNet3DWithGroupedMultiBranch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DWithNormalConv3DCSAM':
-            self.I2PNet = UNet3DWithNormalConv3DCSAM(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithNormalConv3DPATDC':
-            self.I2PNet = UNet3DWithNormalConv3DPATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithNormalConv3DPATDCSplit':
-            self.I2PNet = UNet3DWithNormalConv3DPATDCSplit(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
+        elif net1name=='TOSConvNet':
+            self.I2PNet = TOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=False, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 seq_len=img_num)
+        elif net1name in ('DynamicTOSConvNet', 'DynamicTOSconvNet'):
+            self.I2PNet = DynamicTOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=False, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 seq_len=img_num)
+        elif net1name in ('TZSConvNet', 'TZSconvNet'):
+            self.I2PNet = TZSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=False, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 seq_len=img_num)
         else:
             print('net1name 错误！')
         self.sigmoid = nn.Sigmoid()
@@ -180,10 +125,7 @@ class Net1Only(nn.Module):
         b, c, t, h, w = batch['input'].shape
 
         ################################运行Net1##################################
-        if self.net1name == 'UNet3DwithZZLB':
-            voxel_features = self.I2PNet(batch) 
-        else:
-            voxel_features = self.I2PNet(batch['input']) 
+        voxel_features = self.I2PNet(batch['input'])
         ##########################################################################
         
         
@@ -271,11 +213,11 @@ class Net1Only(nn.Module):
     ###############################################滑窗推理######################################################
 
 
-def Net1(heads, image_size = [512,512], img_num = 20, layers=4, thresh=None,input_channels=1,feat_channels=[16,32,64],T_pooling=False,groups=2,downsample_mode='maxpool',net1name='UNet3D'):
+def Net1(heads, image_size = [512,512], img_num = 20, layers=4, thresh=None,input_channels=1,feat_channels=[16,32,64],T_pooling=False,groups=2,downsample_mode='maxpool',net1name='UNet3D', opt=None):
     model =Net1Only(heads,  image_size = image_size, img_num = img_num, 
-                                          layers=layers, thresh=thresh, input_channels=input_channels,
+                                          layers=layers, thresh=thresh,
                                           feat_channels=feat_channels,T_pooling=T_pooling,
-                                          groups=groups,downsample_mode=downsample_mode,net1name=net1name)
+                                          groups=groups,downsample_mode=downsample_mode,net1name=net1name, opt=opt)
     return model
 
 
@@ -296,7 +238,7 @@ if __name__ == '__main__':
         # 初始化模型
         model = Net1(
             heads=heads, image_size = [512, 512], img_num = 10, layers=3.61, thresh=3,net1name='UNet3DWithNormalConv3D',
-            feat_channels=[8,16,32,64], input_channels=1,
+            feat_channels=[8,16,32,64],
         ).to(device).eval()
         # print("\n=== 网络结构概要 ===")
         # print(model)  # 打印完整模型结构

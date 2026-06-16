@@ -11,14 +11,14 @@ class opts(object):
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         # basic experiment setting
-        self.parser.add_argument('--discribe', default='[SGNet_3D_4_8_16_32_wmfe_[41 21 11]]主要是因为mfe是对称的范围，21的话只能看到10*10的窗口') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享，
+        self.parser.add_argument('--discribe', default='ReSGNet_Linear10_WOMFE_TOSConv_T11') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享，
         self.parser.add_argument('--task', default='ctdet_points',
                                  help='task name.  ctdet_points |  ctdet ')
-        self.parser.add_argument('--exp_name', default='SGNet_3D_4_8_16_32_[41 21 11]', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
+        self.parser.add_argument('--exp_name', default='ReSGNet_Linear10_WOMFE_TOSConv_T11', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3
-        self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # 修改3
-        self.parser.add_argument('--load_model', default= '',
+        self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3
+        self.parser.add_argument('--load_model', default= 'weights/rs_car_new_multi/I2PSOD/SGNet_Linear10_WOMFE_10x9LinearTOS_cat_supMode_0_seglen10_weights2026_06_16_14_59_55/model_best_dis_f1_best.pth',
                                  help='path to pretrained model')
         self.parser.add_argument('--resume', type=bool, default=True, help='resume an experiment.')
         self.parser.add_argument('--down_ratio', type=int, default=1, help='output stride. Currently only supports for 1.')
@@ -52,8 +52,8 @@ class opts(object):
         self.parser.add_argument('--show_results', type=bool, default=False, help='whether or not to show the detection results. Only for test.')
         self.parser.add_argument('--save_track_results', type=bool, default=False, help='whether or not to save the tracking results of sort. Only for testTrackingSort.')
         self.parser.add_argument('--metric', type=int, default={'inference':True, # 修改 7
-                                                                'run_ap':True, 'run_f1':True,
-                                                                'save_json':True, 'save_mat':True, 'f1_mode':['iou']},
+                                                                'run_ap':False, 'run_f1':True,
+                                                                'save_json':True, 'save_mat':True, 'f1_mode':['dis']},
                                  help='how to test')
 
         # save
@@ -63,7 +63,7 @@ class opts(object):
         # dataset
         self.parser.add_argument('--data_mode', type=str, default='multi',
                                  help='dataset name.')
-        self.parser.add_argument('--datasetname', type=str, default='aircraft', # rs_car # aircraft # rs_car_new # sdm_car # mir  修改8
+        self.parser.add_argument('--datasetname', type=str, default='rs_car_new', # rs_car # aircraft # rs_car_new # sdm_car # mir  修改8
                                  help='dataset name.')
         # self.parser.add_argument('--data_dir', type=str, default='/root/autodl-tmp/RsCarData_New_Part/',  #/root/autodl-tmp/RsCarData/', # /root/autodl-tmp/AircraftDataset23/
         #                          # 注意以 / 结尾
@@ -108,13 +108,14 @@ class opts(object):
         self.parser.add_argument('--stage1_epochs', type=int, default=10, help='number of epochs for stage 1 training.')
         
         # net1 define
-        self.parser.add_argument('--feat_channels', type=list, default=[4,8,16,32], help='unet upsample channels') # [8,16,32,64] for Unet3DWithNormalConv3D # [8,16,32,16,8] for LightWeightedConv3D
-        self.parser.add_argument('--input_channels', type=int, default=1, help='how many channles feature input net2')
+        self.parser.add_argument('--feat_channels', type=list, default=[16,16], help='unet upsample channels') # [8,16,32,64] for Unet3DWithNormalConv3D # [8,16,32,16,8] for LightWeightedConv3D
         self.parser.add_argument('--T_pooling', type=bool, default=False,  help='is pooling t dim or not')
         self.parser.add_argument('--groups', type=int, default=-1, help='net1 conv groups(must be feat_channels % == 0)')
         self.parser.add_argument('--downsample_mode', type=str, default='maxpool', help='downsample mode "stride" or "maxpool"')
-        self.parser.add_argument('--net1name', type=str, default='UNet3DWithNormalConv3D', help='encoder use ATDC') # LightWeightedConv3D  # UNet3DWithNormalConv3D
-        #可视化
+        self.parser.add_argument('--net1name', type=str, default='TOSConvNet', help='encoder use ATDC, supports TOSConvNet/DynamicTOSConvNet/TZSConvNet/TZSconvNet') # LightWeightedConv3D  # UNet3DWithNormalConv3D # TOSConvNet  # TZSConvNet # 修改11
+        self.parser.add_argument('--use_tzsconv', type=bool, default=True, help='whether the temporal branch is enabled for TOSConvNet/DynamicTOSConvNet/TZSConvNet; if false, use plain Conv3d stack only')
+        self.parser.add_argument('--MFE', type=str, default='')
+        #可视化 # cosv10 
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
         self.parser.add_argument('--vis_mode', type=str, default='mean', help='feature map aggregation mode: mean / max / channel index (e.g. 0 1 2)')
         self.parser.add_argument('--vis_layers', type=str, nargs='+', default=['model.I2PNet.final_conv','model.sp_backbone.conv1','model.sp_backbone.shortcut1','model.sp_backbone.shortcut1fusion'], help='layer names for capturing feature maps')
@@ -137,7 +138,7 @@ class opts(object):
             opt.data_sampling = 2
             opt.batch_size= 8
         if opt.seqLen == 10:
-            opt.data_sampling = 5
+            opt.data_sampling = 10
             opt.batch_size= 4  # 默认8
             if opt.thresh == 1:
                 opt.batch_size= 2

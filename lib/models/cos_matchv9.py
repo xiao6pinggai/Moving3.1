@@ -6,9 +6,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os, sys
 
-ROOT_DIR = "/root/autodl-tmp/Moving3.1"
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
 from lib.models.spconv_utils import replace_feature, spconv
 import torch
 import torch.nn as nn

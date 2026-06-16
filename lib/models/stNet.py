@@ -24,42 +24,22 @@ def get_det_net(heads, model_name, img_size, img_num, opt, thresh=None):
         model = model_func(heads, img_size, img_num, layers=opt.layers, thresh=thresh)
     elif model_name == 'LightweightUnet3DDynamic':
         model = model_func(out_channel_list=[32, 64, 128], num_classes=1)
-    elif model_name == 'I2PSOD':
-        img_num = opt.seqLen
-        feat_channels = opt.feat_channels
-        layers = opt.layers
-        thresh = opt.thresh
-        input_channels = 1
-        T_pooling = opt.T_pooling
-        groups = opt.groups
-        downsample_mode=opt.downsample_mode
-        net1name = opt.net1name
-        model = model_func(heads, image_size=img_size, img_num=img_num, layers = layers, thresh=thresh, input_channels=input_channels, 
-                 feat_channels=feat_channels, T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,net1name=net1name)
-    elif model_name == 'Net1':
-        img_num = opt.seqLen
-        feat_channels = opt.feat_channels
-        layers = opt.layers
-        thresh = opt.thresh
-        input_channels = 1
-        T_pooling = opt.T_pooling
-        groups = opt.groups
-        downsample_mode=opt.downsample_mode
-        net1name = opt.net1name
-        model = model_func(heads, image_size=img_size, img_num=img_num, layers = layers, thresh=thresh, input_channels=input_channels, 
-                 feat_channels=feat_channels, T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,net1name=net1name)
-    elif model_name == 'I2PSOD_test':
-        img_num = opt.seqLen
-        feat_channels = opt.feat_channels
-        layers = opt.layers
-        thresh = opt.thresh
-        input_channels = 1
-        T_pooling = opt.T_pooling
-        groups = opt.groups
-        downsample_mode=opt.downsample_mode
-        net1name = opt.net1name
-        model = model_func(heads, image_size=img_size, img_num=img_num, layers = layers, thresh=thresh, input_channels=input_channels, 
-                 feat_channels=feat_channels, T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,net1name=net1name)
+    elif model_name in {'I2PSOD', 'Net1', 'I2PSOD_test'}:
+        model_kwargs = dict(
+            image_size=img_size,
+            img_num=opt.seqLen,
+            layers=opt.layers,
+            thresh=opt.thresh,
+            feat_channels=opt.feat_channels,
+            T_pooling=opt.T_pooling,
+            groups=opt.groups,
+            downsample_mode=opt.downsample_mode,
+            net1name=opt.net1name,
+        )
+        if model_name == 'Net1':
+            model = model_func(heads, **model_kwargs, opt=opt)
+        else:
+            model = model_func(heads, **model_kwargs, opt=opt)
     else:
         model = model_func(heads)
     return model

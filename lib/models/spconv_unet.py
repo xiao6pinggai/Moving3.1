@@ -5,10 +5,12 @@ import torch
 import torch.nn as nn
 import os, sys
 
-ROOT_DIR = "/root/autodl-tmp/Moving3.1"
-# 确保根目录在sys.path首位（覆盖默认的子目录）
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
 
 from lib.models.spconv_utils import replace_feature, spconv
 # from lib.utils import common_utils
@@ -1151,6 +1153,8 @@ class UNetV2_3_T_nodown_v2(nn.Module):
     def __init__(self, input_channels, grid_size, voxel_size=None, point_cloud_range=None, model_cfg=None, **kwargs):
         super().__init__()
         self.model_cfg = model_cfg # None
+        self.opt = kwargs['opt']
+        self.MFE = self.opt.MFE
         self.sparse_shape = grid_size[::-1] + [1, 0, 0]
         self.voxel_size = voxel_size
         self.point_cloud_range = point_cloud_range
@@ -1191,20 +1195,23 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         #     block(64, 64, 3, norm_fn=norm_fn, padding=1, indice_key='subm4'),
         #     block(64, 64, 3, norm_fn=norm_fn, padding=1, indice_key='subm4'),
         # )
-        self.x_bottle = spconv.SparseSequential(
-            block(64, 128, 3, norm_fn=norm_fn, stride=(1,2,2), padding=1, indice_key='spconv_b', conv_type='spconv'),#d3
-            # 1. 升维: 64 -> 128 (使用 SubMConv 保持形状，或者 stride=1 的 Conv)
-            # block(64, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_1'),
-            # 真正的bottle
-            # 2. (可选) 中间深层处理: 128 -> 128
-            # block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_2'),
-            # 3. 降维: 128 -> 64
-            block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'),
+        # self.x_bottle = spconv.SparseSequential(
+        #     block(64, 128, 3, norm_fn=norm_fn, stride=(1,2,2), padding=1, indice_key='spconv_b', conv_type='spconv'),#d3
+        #     # 1. 升维: 64 -> 128 (使用 SubMConv 保持形状，或者 stride=1 的 Conv)
+        #     # block(64, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_1'),
+        #     # 真正的bottle
+        #     # 2. (可选) 中间深层处理: 128 -> 128
+        #     # block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_2'),
+        #     # 3. 降维: 128 -> 64
+        #     block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'), 
 
-            block(128, 64, 3, stride=(1, 2, 2), padding=1,norm_fn=norm_fn, indice_key='spconv_b', conv_type='inverseconv')
-        )
+        #     block(128, 64, 3, stride=(1, 2, 2), padding=1,norm_fn=norm_fn, indice_key='spconv_b', conv_type='inverseconv')
+        # )
         
-
+        self.x_bottle = spconv.SparseSequential(
+            block(64, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'),
+            block(128, 64, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'), 
+        )
         # decoder
         # [400, 352, 11] <- [200, 176, 5]
         # self.conv_up_t4 = SparseBasicBlock(64, 64, indice_key='subm4', norm_fn=norm_fn)
@@ -1223,12 +1230,13 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
 
         # mfe # V2!!!
-        self.sptial2d1 = block(16, 16, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm1_1') # 2d
-        self.sptial2d2 = block(32, 32, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm2_2')
-        self.sptial2d3 = block(64, 64, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm3_3')
-        self.shortcut1 = SparseSymmetricCosineAttention(in_channels=16, kernel_size=41, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d1)
-        self.shortcut2 = SparseSymmetricCosineAttention(in_channels=32, kernel_size=21, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d2)
-        self.shortcut3 = SparseSymmetricCosineAttention(in_channels=64, kernel_size=11, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d3)
+        if self.MFE == 'cosv10':
+            self.sptial2d1 = block(16, 16, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm1_1') # 2d
+            self.sptial2d2 = block(32, 32, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm2_2')
+            self.sptial2d3 = block(64, 64, (1,3,3), norm_fn=norm_fn, dialtion=(1,1,1),padding=(0,1,1), indice_key='subm3_3')
+            self.shortcut1 = SparseSymmetricCosineAttention(in_channels=16, kernel_size=41, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d1)
+            self.shortcut2 = SparseSymmetricCosineAttention(in_channels=32, kernel_size=21, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d2)
+            self.shortcut3 = SparseSymmetricCosineAttention(in_channels=64, kernel_size=11, use_qkv=False, use_maxpool=False, alpha=0.5, use_biqkv=False,temporal_dilation=1, conv=self.sptial2d3)
         # mfe
         
         
@@ -1238,9 +1246,10 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
 
         # mfe
-        self.shortcut1fusion = GroupedDilatedBlock(16, 16, 3, dilations=[1, 2, 3,4], indice_key='subm1')
-        self.shortcut2fusion = GroupedDilatedBlock(32, 32, 3, dilations=[1, 2, 3,4], indice_key='subm2')
-        self.shortcut3fusion = GroupedDilatedBlock(64, 64, 3, dilations=[1, 2, 3,4], indice_key='subm3')
+        if self.MFE == 'cosv10':
+            self.shortcut1fusion = GroupedDilatedBlock(16, 16, 3, dilations=[1, 2, 3,4], indice_key='subm1')
+            self.shortcut2fusion = GroupedDilatedBlock(32, 32, 3, dilations=[1, 2, 3,4], indice_key='subm2')
+            self.shortcut3fusion = GroupedDilatedBlock(64, 64, 3, dilations=[1, 2, 3,4], indice_key='subm3')
         # mfe
 
 
@@ -1353,20 +1362,23 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
         # w/o shortcut process
         # x_conv3 = self.se3(x_conv3)
-        x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
-        x_conv3 = self.shortcut3fusion(x_conv3)
+        if self.MFE == 'cosv10':
+            x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
+            x_conv3 = self.shortcut3fusion(x_conv3)
         x_up3 = self.UR_block_forward(x_conv3, x_bottle, self.conv_up_t3, self.conv_up_m3, self.inv_conv3)
         # [1600, 1408, 41] <- [800, 704, 21]
         # w/o shortcut process
         # x_conv2 = self.se2(x_conv2)
-        x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
-        x_conv2 = self.shortcut2fusion(x_conv2)
+        if self.MFE == 'cosv10':
+            x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
+            x_conv2 = self.shortcut2fusion(x_conv2)
         x_up2 = self.UR_block_forward(x_conv2, x_up3, self.conv_up_t2, self.conv_up_m2, self.inv_conv2)
         # [1600, 1408, 41] <- [1600, 1408, 41]
         # w/o shortcut process
         # x_conv1 = self.se1(x_conv1)
-        x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
-        x_conv1 = self.shortcut1fusion(x_conv1)
+        if self.MFE == 'cosv10':
+            x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
+            x_conv1 = self.shortcut1fusion(x_conv1)
         x_up1 = self.UR_block_forward(x_conv1, x_up2, self.conv_up_t1, self.conv_up_m1, self.conv5)
 
         batch_dict['point_features'] = x_up1

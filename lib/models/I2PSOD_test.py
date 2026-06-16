@@ -4,49 +4,60 @@ import torch.nn.functional as F
 from functools import partial
 import numpy as np
 import os, sys
+import time
+import atexit
+import math
 
-ROOT_DIR = "/root/autodl-tmp/Moving3.1"
-# 确保根目录在sys.path首位（覆盖默认的子目录）
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
 
 
-from lib.models.noramlconv_unet3d10 import UNet3DCatATDC
-from lib.models.noramlconv_unet3d9 import UNet3DAddATDC
 from lib.utils1.enlarge_mask import dilate_mask_fast
 from lib.utils1.bbox2binarymask import bboxes_to_binary_mask
 
-# 验证是否生效
-# print("修正后的sys.path:", sys.path[:3])
 from lib.models.spconv_unet import UNetV2, UNetV2_3, UNetV2_2, UNetV2_3_32, UNetV2_3_T_nodown, UNetV2_3_T_nodown_maxpool, UNetV2_3_T_nodown_v2, UNetV2_3_T_nodown_v3
 from lib.models.spconv_utils import replace_feature, spconv
-from lib.models.noramlconv_unet3d2 import UNet3D, UNet3DATDC
-from lib.models.noramlconv_unet3d0_1 import UNet3DGroupDilation4Branch
-from lib.models.noramlconv_unet3d3 import UNet3DATDCDilation
-from lib.models.noramlconv_unet3d4 import UNet3DZSTA
-from lib.models.noramlconv_unet3d5 import UNet3DTAM
-from lib.models.noramlconv_unet3d6 import UNet3DGroupATDCDilation
-from lib.models.noramlconv_unet3d8 import UNet3DGroupATDCDilation4Branch
-from lib.models.noramlconv_unet3d9 import UNet3DAddATDC
-from lib.models.noramlconv_unet3d11 import UNet3DwithZZLB
-from lib.models.noramlconv_unet3d12 import UNet3DWithATDCDilation2
-from lib.models.noramlconv_unet3d13 import UNet3DWithTSC3D
-from lib.models.noramlconv_unet3d2_1 import UNet3DWithNormalConv3D, EncoderOnlyConv3DProposalNet
-from lib.models.noramlconv_unet3d_3branch import UNet3DWithNormalConv3D3Branch
-from lib.models.noramlconv_unet3d_3branchDilation import UNet3DWithGroupedMultiBranch
-from lib.models.noramlconv_unet3dcsam import UNet3DWithNormalConv3DCSAM
-from lib.models.noramlconv_unet3patdc import UNet3DWithNormalConv3DPATDC
-
-from lib.models.noramlconv_unet3patdc_split import UNet3DWithNormalConv3DPATDCSplit
+from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D, EncoderOnlyConv3DProposalNet, TOSConvNet, TZSConvNet, DynamicTOSConvNet
 from lib.utils1.show_one_img import show_one_img
 import torch
 
 class Img2PointsSmallObjectDetection(nn.Module):
     def __init__(self, heads, image_size = [512,512], img_num = 20, layers = 3, thresh=None, input_channels=1,
                  feat_channels=[16,32,64,128], T_pooling=False,groups=1,downsample_mode='stride',
-                 net1name='UNet3DWithNormalConv3D'):
+                 net1name='UNet3DWithNormalConv3D', opt=None):
         super().__init__()
         self.print = 0
+        self.use_runtime = getattr(opt, 'use_runtime', False)
+        self.runtime_component_names = (
+            'I2PNet',
+            'ACS',
+            'BackboneNoMFE',
+            'MFE',
+            'DetHead',
+        )
+        self._mfe_module_prefixes = (
+            'shortcut1',
+            'shortcut2',
+            'shortcut3',
+            'shortcut1fusion',
+            'shortcut2fusion',
+            'shortcut3fusion',
+            'sptial2d1',
+            'sptial2d2',
+            'sptial2d3',
+        )
+        self._component_param_cache = None
+        self._runtime_frame_divisor = 1.0
+        self._component_profile_printed = False
+        self._component_profile_finalize_registered = False
+        if not self._component_profile_finalize_registered:
+            atexit.register(self._finalize_component_profile)
+            self._component_profile_finalize_registered = True
+        self.reset_runtime_stats()
 
         # ===== 数据集级累计统计量（非训练阶段使用）=====
         # 点级召回：采样点在框内 / 框内总像素  (按帧-框平均)
@@ -62,66 +73,34 @@ class Img2PointsSmallObjectDetection(nn.Module):
         # ==================================================
         # points generate net
         self.net1name=net1name
-        self.net1_feature_channels = input_channels
-        if net1name == 'UNet3DWithNormalConv3D':
-            self.net1_feature_channels = feat_channels[0]
-        if net1name=='UNet3DATDC':
-                self.I2PNet = UNet3DATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
+        self.net1_feature_channels = feat_channels[0]
+        if net1name=='UNet3DWithNormalConv3D':
+            self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True,TConvOnly=False)
+        elif net1name=='UNet2DWithNormalConv2D':
+            self.I2PNet = UNet2DWithNormalConv2D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True)
+        elif net1name=='LightWeightedConv3D':
+            self.I2PNet = LightWeightedConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DATDCDilation':
-                self.I2PNet = UNet3DATDCDilation(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3D': 
-            self.I2PNet = UNet3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DZSTA':
-            self.I2PNet = UNet3DZSTA(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DTAM':
-            self.I2PNet = UNet3DTAM(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DGroupATDCDilation':
-            self.I2PNet = UNet3DGroupATDCDilation(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DGroupATDCDilation4Branch':
-            self.I2PNet = UNet3DGroupATDCDilation4Branch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DGroupDilation4Branch': # 验证时域金字塔的作用
-            self.I2PNet = UNet3DGroupDilation4Branch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DAddATDC': 
-            self.I2PNet = UNet3DAddATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DCatATDC': 
-            self.I2PNet = UNet3DCatATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)  
-        elif net1name=='UNet3DwithZZLB':
-            self.I2PNet = UNet3DwithZZLB(num_channels=4, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithATDCDilation2':
-            self.I2PNet = UNet3DWithATDCDilation2(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithNormalConv3D':
-            self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False,TConvOnly=True)
         elif net1name=='EncoderOnlyConv3DProposalNet':
-            self.I2PNet = EncoderOnlyConv3DProposalNet(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
+            self.I2PNet = EncoderOnlyConv3DProposalNet(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True, TConvOnly=False)
-        elif net1name=='UNet3DWithTSC3D':
-            self.I2PNet = UNet3DWithTSC3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithGroupedMultiBranch':
-            self.I2PNet = UNet3DWithGroupedMultiBranch(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,downsample_mode=downsample_mode)
-        elif net1name == 'UNet3DWithNormalConv3DCSAM':
-            self.I2PNet = UNet3DWithNormalConv3DCSAM(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithNormalConv3DPATDC':
-            self.I2PNet = UNet3DWithNormalConv3DPATDC(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
-        elif net1name=='UNet3DWithNormalConv3DPATDCSplit':
-            self.I2PNet = UNet3DWithNormalConv3DPATDCSplit(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
-                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode)
+        elif net1name=='TOSConvNet':
+            self.I2PNet = TOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=True, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 seq_len=img_num)
+        elif net1name in ('DynamicTOSConvNet', 'DynamicTOSconvNet'):
+            self.I2PNet = DynamicTOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=True, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 seq_len=img_num)
+        elif net1name in ('TZSConvNet', 'TZSconvNet'):
+            self.I2PNet = TZSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=True, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 seq_len=img_num)
         else:
             print('net1name 错误！')
         self.sigmoid = nn.Sigmoid()
@@ -141,7 +120,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
         elif layers == 3.6:
             self.sp_backbone = UNetV2_3_T_nodown(self.net1_feature_channels, grid_size)
         elif layers == 3.61:
-            self.sp_backbone = UNetV2_3_T_nodown_v2(self.net1_feature_channels, grid_size)  
+            self.sp_backbone = UNetV2_3_T_nodown_v2(self.net1_feature_channels, grid_size, opt=opt)  
         elif layers == 3.62:
             self.sp_backbone = UNetV2_3_T_nodown_v3(self.net1_feature_channels, grid_size)  
         elif layers == 3.7:
@@ -241,70 +220,38 @@ class Img2PointsSmallObjectDetection(nn.Module):
     '''
 
     # ========== 集成到你的forward函数中 ==========
-    def get_mask_by_mean_std(self, soft_mask, var_coeff=3, min_thresh=0.01):
+    def get_mask_by_mean_std(self, soft_mask, var_coeff=3):
         """
-        基于soft_mask的空间维度(HW)均值+方差计算动态阈值
-        保证每一帧(T)的有效点数≥50（不足则取该帧的Top50）
+        基于soft_mask的空间维度(HW)均值+方差计算动态阈值。
+        当阈值筛出的点数少于50时，按每个样本在 T*H*W 范围内补足 top50。
         """
         var_coeff = var_coeff if var_coeff is not None else 3
         B, C, T, H, W = soft_mask.shape
         assert C == 1, "soft_mask通道数必须为1"
-        device = soft_mask.device
-        
-        # =========================================================================
-        # Part 1: 计算均值方差 (完全对齐 Reference Snippet)
-        # -------------------------------------------------------------------------
-        # 输入: [B, 1, T, H, W]
-        # dim=[-2, -1]: 对 H, W 求统计量 -> 结果 [B, 1, T]
-        # unsqueeze: 恢复为 [B, 1, T, 1, 1] 以便广播
-        # =========================================================================
-        
-        # : Show B,C,T,H,W collapsing H and W to 1,1
+
+        # 对 H, W 求均值/标准差 -> [B, 1, T, 1, 1]
         mask_mean = torch.mean(soft_mask, dim=[-2, -1]).unsqueeze(-1).unsqueeze(-1)
         mask_std = torch.std(soft_mask, dim=[-2, -1]).unsqueeze(-1).unsqueeze(-1)
-        
-        # 2. 计算动态阈值
-        # 利用广播机制: [B,1,T,1,1] 作用于 [B,1,T,H,W]
+
+        # 动态阈值：均值 + 系数 * 标准差
         dynamic_thresh = mask_mean + var_coeff * mask_std
-        dynamic_thresh = torch.clamp(dynamic_thresh, min=min_thresh, max=1.0)
-        
-        # 3. 初始生成二值掩码 [B, 1, T, H, W]
+
+        # 初始二值掩码 [B, 1, T, H, W]
         binary_mask = (soft_mask > dynamic_thresh).float()
-        
-        # =========================================================================
-        # Part 2: Top-50 兜底逻辑
-        # 为了方便遍历每一帧，这里再进行 View 操作
-        # =========================================================================
-        
-        # 将 [B, 1, T, H, W] 展平为 [B*T, H*W] 以便循环处理
-        # 注意：这里 view 出来的是原 tensor 的视窗，修改它会影响 binary_mask
-        binary_mask_flat = binary_mask.view(B * T, -1)
-        soft_mask_flat = soft_mask.view(B * T, -1)
-        
-        # 统计每一帧的有效点数
-        valid_pts_count = torch.sum(binary_mask_flat, dim=-1) # [B*T]
-        
-        num_samples = B * T
-        for i in range(num_samples):
-            if valid_pts_count[i] < 50:
-                # 该帧有效点不足50，取该帧的Top50
-                single_soft_mask = soft_mask_flat[i, :] # [H*W]
-                
-                # 这里的 topk 是在 H*W 范围内找
-                k = min(50, single_soft_mask.shape[0])
-                _, topk_idx = torch.topk(single_soft_mask, k=k, dim=0, largest=True)
-                
-                # 重置该帧的 mask
-                topk_mask = torch.zeros_like(single_soft_mask, device=device)
-                topk_mask[topk_idx] = 1.0
-                
-                # 修改 flat 视图，原 binary_mask 也会被修改
-                binary_mask_flat[i, :] = topk_mask
 
-        self.print += 1
+        # 若某个样本有效点不足50，则用该样本全时空范围内的 top50 兜底
+        binary_mask_flat = binary_mask.view(B, -1)
+        soft_mask_flat = soft_mask.view(B, -1)
+        valid_pts_count = torch.sum(binary_mask_flat, dim=-1)
+        min_points = min(50, soft_mask_flat.shape[-1])
 
-        # binary_mask 在 loop 中已被原地修改，直接返回即可
-        # 形状依然是 [B, 1, T, H, W]
+        for batch_idx in range(B):
+            if valid_pts_count[batch_idx] < min_points:
+                topk_idx = torch.topk(soft_mask_flat[batch_idx], k=min_points, dim=0, largest=True).indices
+                binary_mask_flat[batch_idx].zero_()
+                binary_mask_flat[batch_idx, topk_idx] = 1.0
+
+        binary_mask = binary_mask_flat.view(B, 1, T, H, W)
         return binary_mask
 
     # ------------------------------------------------------------------
@@ -323,11 +270,11 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
         指标定义
         --------
-        1. 点级召回率（bbox_recall）—— 点级，有效点在框内的平均占比
+        1. 第一阶段命中覆盖率（coverage_rate）—— 点级，有效点在框内的平均覆盖占比
              对每个有效框计算：该帧采样点中落在框内的点数 / 框内像素数
              取所有有效框的平均值作为当前 batch 的指标。
 
-        2. 实例级命中率（instance_hit_rate）—— 实例级
+        2. 第一阶段命中率（hit_rate）—— 实例级
              有效框中至少有 1 个采样点落在框内 → 命中
              命中框数 / 有效框总数。
 
@@ -425,8 +372,8 @@ class Img2PointsSmallObjectDetection(nn.Module):
         # ---- 打印 ----
         print(
             f"[Stage1 Metrics] Batch {self._stat_batch_idx:04d} | "
-            f"当前: 点级召回={cur_recall*100:.2f}%  实例命中率={cur_hit*100:.2f}%  虚警率={cur_fa*100:.4f}% | "
-            f"数据集累计: 点级召回={ds_recall*100:.2f}%  实例命中率={ds_hit*100:.2f}%  虚警率={ds_fa*100:.4f}%"
+            f"当前: 命中率={cur_hit*100:.2f}%  命中覆盖率={cur_recall*100:.2f}%  虚警率={cur_fa*100:.4f}% | "
+            f"数据集累计: 命中率={ds_hit*100:.2f}%  命中覆盖率={ds_recall*100:.2f}%  虚警率={ds_fa*100:.4f}%"
         )
 
     def print_dataset_stage1_summary(self):
@@ -437,11 +384,295 @@ class Img2PointsSmallObjectDetection(nn.Module):
         print("=" * 80)
         print(f"[Stage1 Dataset Summary]  共处理 {self._stat_batch_idx} 个 batch，"
               f"有效框 {self._stat_hit_den} 个，帧 {self._stat_fa_cnt} 帧")
-        print(f"  点级召回率（bbox_recall）  : {ds_recall*100:.4f}%")
-        print(f"  实例级命中率（hit_rate）   : {ds_hit*100:.4f}%")
-        print(f"  点级虚警率（false_alarm）  : {ds_fa*100:.6f}%")
+        print(f"  第一阶段命中率（hit_rate）        : {ds_hit*100:.4f}%")
+        print(f"  第一阶段命中覆盖率（coverage_rate）: {ds_recall*100:.4f}%")
+        print(f"  点级虚警率（false_alarm）         : {ds_fa*100:.6f}%")
         print("=" * 80)
     # ------------------------------------------------------------------
+
+
+    def reset_runtime_stats(self):
+        self._runtime_sum = {name: 0.0 for name in self.runtime_component_names}
+        self._flops_sum = {name: 0.0 for name in self.runtime_component_names}
+        self._runtime_count = 0
+
+    def get_runtime_stats(self, per_frame_divisor=1):
+        if self._runtime_count == 0:
+            return {}
+        per_frame_divisor = max(float(per_frame_divisor), 1.0)
+        return {
+            name: self._runtime_sum[name] / self._runtime_count / per_frame_divisor
+            for name in self.runtime_component_names
+        }
+
+    def get_flops_stats(self, per_frame_divisor=1):
+        if self._runtime_count == 0:
+            return {}
+        per_frame_divisor = max(float(per_frame_divisor), 1.0)
+        return {
+            name: self._flops_sum[name] / self._runtime_count / per_frame_divisor
+            for name in self.runtime_component_names
+        }
+
+    def get_component_stats(self, per_frame_divisor=1):
+        runtime_stats = self.get_runtime_stats(per_frame_divisor=per_frame_divisor)
+        flops_stats = self.get_flops_stats(per_frame_divisor=per_frame_divisor)
+        param_stats = self.get_component_param_stats()
+        stats = {}
+        for name in self.runtime_component_names:
+            stats[name] = {
+                'runtime': float(runtime_stats.get(name, 0.0)),
+                'flops': float(flops_stats.get(name, 0.0)),
+                'params': int(param_stats.get(name, 0)),
+            }
+        stats['Total'] = {
+            'runtime': sum(stats[name]['runtime'] for name in self.runtime_component_names),
+            'flops': sum(stats[name]['flops'] for name in self.runtime_component_names),
+            'params': sum(stats[name]['params'] for name in self.runtime_component_names),
+        }
+        return stats
+
+    def print_component_stats_summary(self, per_frame_divisor=None, mark_printed=True):
+        if self._runtime_count == 0:
+            return
+        if per_frame_divisor is None:
+            per_frame_divisor = self._runtime_frame_divisor
+        stats = self.get_component_stats(per_frame_divisor=per_frame_divisor)
+        print('=' * 80)
+        print('[Component Profiling Summary]')
+        for component_name in self.runtime_component_names:
+            item = stats[component_name]
+            print(
+                f"  {component_name}: runtime={item['runtime']:.6f}s  "
+                f"FLOPs={item['flops']:.6f}  Params={item['params']}"
+            )
+        total = stats['Total']
+        print(
+            f"  Total: runtime={total['runtime']:.6f}s  "
+            f"FLOPs={total['flops']:.6f}  Params={total['params']}"
+        )
+        print('=' * 80)
+        if mark_printed:
+            self._component_profile_printed = True
+
+    def _finalize_component_profile(self):
+        try:
+            if not self.use_runtime:
+                return
+            if self._component_profile_printed:
+                return
+            if self._runtime_count == 0:
+                return
+            self.print_component_stats_summary(mark_printed=True)
+        except Exception as exc:
+            print(f"[Component Profiling Summary] 打印失败: {exc}")
+
+    def _runtime_enabled(self):
+        return self.use_runtime and (not self.training)
+
+    def _flops_enabled(self):
+        return self.use_runtime and (not self.training)
+
+    def _is_mfe_local_name(self, local_name):
+        for prefix in self._mfe_module_prefixes:
+            if local_name == prefix or local_name.startswith(prefix + '.'):
+                return True
+        return False
+
+    def _classify_module_component(self, module_name):
+        if module_name.startswith('I2PNet.'):
+            return 'I2PNet'
+        if module_name.startswith('sp_backbone.'):
+            local_name = module_name[len('sp_backbone.'):]
+            return 'MFE' if self._is_mfe_local_name(local_name) else 'BackboneNoMFE'
+        for head in self.heads:
+            if module_name == head or module_name.startswith(head + '.'):
+                return 'DetHead'
+        if module_name == 'sigmoid' or module_name == 'conv_std' or module_name.startswith('conv_std.'):
+            return 'ACS'
+        return None
+
+    def _classify_parameter_component(self, param_name):
+        if param_name.startswith('I2PNet.'):
+            return 'I2PNet'
+        if param_name.startswith('sp_backbone.'):
+            local_name = param_name[len('sp_backbone.'):]
+            return 'MFE' if self._is_mfe_local_name(local_name) else 'BackboneNoMFE'
+        for head in self.heads:
+            if param_name.startswith(head + '.'):
+                return 'DetHead'
+        if param_name == 'tau' or param_name.startswith('conv_std.'):
+            return 'ACS'
+        return 'ACS'
+
+    def get_component_param_stats(self, refresh=False):
+        if self._component_param_cache is not None and not refresh:
+            return dict(self._component_param_cache)
+        param_stats = {name: 0 for name in self.runtime_component_names}
+        for param_name, param in self.named_parameters():
+            component_name = self._classify_parameter_component(param_name)
+            param_stats[component_name] += int(param.numel())
+        self._component_param_cache = dict(param_stats)
+        return param_stats
+
+    @staticmethod
+    def _sync_device(device):
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+
+    def _runtime_start(self, device):
+        self._sync_device(device)
+        return time.perf_counter()
+
+    def _runtime_stop(self, start_time, device):
+        self._sync_device(device)
+        return time.perf_counter() - start_time
+
+    def _new_runtime_dict(self):
+        return {name: 0.0 for name in self.runtime_component_names}
+
+    def _merge_runtime_dicts(self, *runtime_dicts):
+        merged = self._new_runtime_dict()
+        for runtime_dict in runtime_dicts:
+            if runtime_dict is None:
+                continue
+            for name in self.runtime_component_names:
+                merged[name] += float(runtime_dict.get(name, 0.0))
+        return merged
+
+    def _update_runtime_stats(self, runtime_dict, flops_dict=None):
+        if runtime_dict is None and flops_dict is None:
+            return
+        if runtime_dict is not None:
+            for name in self.runtime_component_names:
+                self._runtime_sum[name] += float(runtime_dict.get(name, 0.0))
+        if flops_dict is not None:
+            for name in self.runtime_component_names:
+                self._flops_sum[name] += float(flops_dict.get(name, 0.0))
+        self._runtime_count += 1
+
+    @staticmethod
+    def _extract_feature_tensor(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj
+        if hasattr(obj, 'features') and isinstance(obj.features, torch.Tensor):
+            return obj.features
+        if isinstance(obj, (tuple, list)):
+            for item in obj:
+                tensor = Img2PointsSmallObjectDetection._extract_feature_tensor(item)
+                if tensor is not None:
+                    return tensor
+        return None
+
+    def _estimate_conv_flops(self, module, output):
+        out_tensor = self._extract_feature_tensor(output)
+        if out_tensor is None:
+            return 0.0
+        if not hasattr(module, 'in_channels') or not hasattr(module, 'out_channels'):
+            return 0.0
+        kernel_size = getattr(module, 'kernel_size', 1)
+        weight = getattr(module, 'weight', None)
+        if isinstance(kernel_size, int):
+            if weight is not None and hasattr(weight, 'dim') and weight.dim() >= 3:
+                kernel_volume = kernel_size ** max(weight.dim() - 2, 1)
+            else:
+                kernel_volume = kernel_size
+        else:
+            kernel_volume = math.prod(kernel_size)
+        groups = max(int(getattr(module, 'groups', 1)), 1)
+        out_channels = max(int(getattr(module, 'out_channels', 1)), 1)
+        if hasattr(output, 'features'):
+            active_points = int(out_tensor.shape[0])
+        else:
+            active_points = int(out_tensor.numel() // out_channels)
+        in_channels = int(getattr(module, 'in_channels', 1))
+        flops = 2.0 * active_points * out_channels * (in_channels / groups) * kernel_volume
+        if getattr(module, 'bias', None) is not None:
+            flops += active_points * out_channels
+        return float(flops)
+
+    def _estimate_attention_flops(self, module, inputs):
+        if not inputs:
+            return 0.0
+        x = inputs[0]
+        if not hasattr(x, 'features'):
+            return 0.0
+        features = x.features
+        if features.dim() != 2:
+            return 0.0
+        num_points, channels = features.shape
+        kernel_size = int(getattr(module, 'k', 1))
+        k2 = kernel_size * kernel_size
+        flops = 0.0
+        flops += 4.0 * num_points * channels
+        flops += 4.0 * num_points * k2 * channels
+        flops += 8.0 * num_points * k2
+        flops += max(k2 - 1, 0) * num_points
+        flops += 3.0 * num_points * channels
+        flops += 6.0 * num_points
+        flops += 3.0 * num_points * channels
+        return float(flops)
+
+    def _estimate_module_flops(self, module, inputs, output):
+        class_name = module.__class__.__name__
+        if 'SparseSymmetricCosineAttention' in class_name:
+            return self._estimate_attention_flops(module, inputs)
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            out_tensor = self._extract_feature_tensor(output)
+            return float(2 * out_tensor.numel()) if out_tensor is not None else 0.0
+        if isinstance(module, (nn.ReLU, nn.ReLU6, nn.LeakyReLU)):
+            out_tensor = self._extract_feature_tensor(output)
+            return float(out_tensor.numel()) if out_tensor is not None else 0.0
+        if isinstance(module, nn.Sigmoid):
+            return 0.0
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)) or 'Conv' in class_name:
+            return self._estimate_conv_flops(module, output)
+        return 0.0
+
+    def _start_flops_capture(self):
+        if not self._flops_enabled():
+            return None, None
+        flops_dict = self._new_runtime_dict()
+        handles = []
+
+        def _make_hook(component_name):
+            def _hook(module, inputs, output):
+                flops_dict[component_name] += self._estimate_module_flops(module, inputs, output)
+            return _hook
+
+        for module_name, module in self.named_modules():
+            if module_name == '':
+                continue
+            component_name = self._classify_module_component(module_name)
+            if component_name is None:
+                continue
+            handles.append(module.register_forward_hook(_make_hook(component_name)))
+        return flops_dict, handles
+
+    @staticmethod
+    def _stop_flops_capture(handles):
+        if handles is None:
+            return
+        for handle in handles:
+            handle.remove()
+
+    @staticmethod
+    def _estimate_sigmoid_flops(tensor):
+        return float(tensor.numel() * 4.0)
+
+    def _estimate_acs_flops(self, soft_mask):
+        if soft_mask is None:
+            return 0.0
+        b, c, t, h, w = soft_mask.shape
+        elements = float(b * c * t * h * w)
+        frames = float(b * c * t)
+        flops = 0.0
+        flops += self._estimate_sigmoid_flops(soft_mask)
+        flops += elements
+        flops += 3.0 * elements
+        flops += 4.0 * frames
+        flops += elements
+        return flops
 
     # ############ 原始 forward（非滑窗版本，已切换至下方滑窗版本）############
     # def forward(self, batch):
@@ -496,76 +727,98 @@ class Img2PointsSmallObjectDetection(nn.Module):
         """
         device = batch['input'].device
         b, c, t, h, w = batch['input'].shape
+        self._runtime_frame_divisor = max(float(t), 1.0)
+        runtime_dict = self._new_runtime_dict() if self._runtime_enabled() else None
+        flops_dict, flops_handles = self._start_flops_capture()
 
-        ################################运行Net1##################################
-        if self.net1name == 'UNet3DwithZZLB':
-            voxel_features = self.I2PNet(batch)
-        else:
-            voxel_features = self.I2PNet(batch['input'])
-        ##########################################################################
+        try:
+            ################################运行Net1##################################
+            if runtime_dict is not None:
+                time_start = self._runtime_start(device)
+            net1_output = self.I2PNet(batch['input'])
+            if runtime_dict is not None:
+                runtime_dict['I2PNet'] += self._runtime_stop(time_start, device)
+            ##########################################################################
 
-        voxel_features_ori = voxel_features.clone()
-        voxel_score_logits = voxel_features
-        if voxel_score_logits.shape[1] > 1:
-            voxel_score_logits = voxel_score_logits.mean(dim=1, keepdim=True)
-        soft_mask = self.sigmoid(voxel_score_logits) # B 1 T H W
-
-        # 核心：基于均值+方差卡阈值
-        binary_mask = self.get_mask_by_mean_std(
-            soft_mask=soft_mask,
-            var_coeff=self.thresh,
-            min_thresh=0.01
-        )
-
-        coords = torch.nonzero(binary_mask.squeeze(1)).contiguous()
-
-        # 计算展平后的索引（依赖于当前 patch_w）
-        batch_idx = coords[:, 0]
-        t_idx     = coords[:, 1]
-        h_idx     = coords[:, 2]
-        w_idx     = coords[:, 3]
-        flattened_indices = batch_idx * t * h * patch_w + t_idx * h * patch_w + h_idx * patch_w + w_idx
-
-        batch_dict = {}
-        voxel_feature_channels = voxel_features.shape[1]
-        voxel_features_flat = voxel_features.permute(0, 2, 3, 4, 1).reshape(b * t * h * patch_w, voxel_feature_channels)
-        batch_dict['voxel_features'] = voxel_features_flat[flattened_indices]
-        batch_dict['voxel_coords']   = coords.to(device)
-        batch_dict['batch_size']     = b
-
-        ################################运行Net2##################################
-        sp_backbone_out = self.sp_backbone(batch_dict)
-        ##########################################################################
-
-        z = {}
-        for head in self.heads:
-            input_sp_tensor = sp_backbone_out['encoded_spconv_tensor']
-            out_h = getattr(self, head)(input_sp_tensor)
-
-            if 'hm' in head:
-                out_h = replace_feature(out_h, self.sigmoid(out_h.features))
-                spatial_features = out_h.dense()
-                spatial_features = torch.clamp(spatial_features, min=1e-4, max=1 - 1e-4)
+            if runtime_dict is not None:
+                time_start = self._runtime_start(device)
+            if net1_output.shape[1] > 1:
+                voxel_score_logits = net1_output.mean(dim=1, keepdim=True)
             else:
-                spatial_features = out_h.dense()
+                voxel_score_logits = net1_output
+            soft_mask = self.sigmoid(voxel_score_logits)
+            if flops_dict is not None:
+                flops_dict['ACS'] += self._estimate_acs_flops(soft_mask)
 
-            # 关键：由于 sp_backbone 初始化时 grid_size 是全图尺寸，
-            # dense() 还原出的特征图是全图宽度。我们需要将其截取为当前的 patch_w
-            z[head] = spatial_features[..., :patch_w]
+            binary_mask = self.get_mask_by_mean_std(
+                soft_mask=soft_mask,
+                var_coeff=self.thresh,
+            )
 
-        z['hm_large_heatmap'] = voxel_features_ori
-        z['voxel_coords']     = batch_dict['voxel_coords']
-        z['soft_mask']        = soft_mask
-        z['binary_mask']      = binary_mask   # 供 forward 拼接后做第一阶段指标计算
+            coords = torch.nonzero(binary_mask.squeeze(1)).contiguous()
+            batch_idx = coords[:, 0]
+            t_idx = coords[:, 1]
+            h_idx = coords[:, 2]
+            w_idx = coords[:, 3]
+            flattened_indices = batch_idx * t * h * patch_w + t_idx * h * patch_w + h_idx * patch_w + w_idx
 
-        return z
+            batch_dict = {}
+            voxel_feature_channels = net1_output.shape[1]
+            voxel_features_flat = net1_output.permute(0, 2, 3, 4, 1).reshape(b * t * h * patch_w, voxel_feature_channels)
+            batch_dict['voxel_features'] = voxel_features_flat[flattened_indices]
+            batch_dict['voxel_coords'] = coords.to(device)
+            batch_dict['batch_size'] = b
+            if runtime_dict is not None:
+                runtime_dict['ACS'] += self._runtime_stop(time_start, device)
+
+            ################################运行Net2##################################
+            if runtime_dict is not None:
+                time_start = self._runtime_start(device)
+            sp_backbone_out = self.sp_backbone(batch_dict)
+            if runtime_dict is not None:
+                stage2_total_runtime = self._runtime_stop(time_start, device)
+                mfe_runtime = float(sp_backbone_out.get('mfe_runtime', 0.0)) if isinstance(sp_backbone_out, dict) else 0.0
+                runtime_dict['MFE'] += mfe_runtime
+                runtime_dict['BackboneNoMFE'] += max(stage2_total_runtime - mfe_runtime, 0.0)
+            ##########################################################################
+
+            z = {}
+            if runtime_dict is not None:
+                time_start = self._runtime_start(device)
+            input_sp_tensor = sp_backbone_out['encoded_spconv_tensor']
+            for head in self.heads:
+                out_h = getattr(self, head)(input_sp_tensor)
+
+                if 'hm' in head:
+                    if flops_dict is not None:
+                        flops_dict['DetHead'] += self._estimate_sigmoid_flops(out_h.features)
+                    out_h = replace_feature(out_h, self.sigmoid(out_h.features))
+                    spatial_features = out_h.dense()
+                    spatial_features = torch.clamp(spatial_features, min=1e-4, max=1 - 1e-4)
+                    if flops_dict is not None:
+                        flops_dict['DetHead'] += float(spatial_features.numel())
+                else:
+                    spatial_features = out_h.dense()
+
+                z[head] = spatial_features[..., :patch_w]
+            if runtime_dict is not None:
+                runtime_dict['DetHead'] += self._runtime_stop(time_start, device)
+
+            z['hm_large_heatmap'] = net1_output
+            z['voxel_coords'] = batch_dict['voxel_coords']
+            z['soft_mask'] = soft_mask
+            z['binary_mask'] = binary_mask
+
+            return z, runtime_dict, flops_dict
+        finally:
+            self._stop_flops_capture(flops_handles)
 
     def forward(self, batch):
         device = batch['input'].device
         b, c, t, h, w = batch['input'].shape
 
         # 触发条件：非训练模式，且宽度足够大 (例如 1920)
-        if not self.training and w >= 19200:
+        if not self.training and w >= 1920:
             w_half = w // 2
 
             # ========== 1. 处理左半部分 ==========
@@ -573,7 +826,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
             batch_left['input'] = batch['input'][..., :w_half]
 
             with torch.no_grad():
-                z_left = self._forward_patch(batch_left, patch_w=w_half)
+                z_left, runtime_left, flops_left = self._forward_patch(batch_left, patch_w=w_half)
 
             del batch_left
             torch.cuda.empty_cache()
@@ -584,7 +837,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
             with torch.no_grad():
                 # 注意右半部分的宽度是 w - w_half (处理奇数宽度的严谨写法)
-                z_right = self._forward_patch(batch_right, patch_w=w - w_half)
+                z_right, runtime_right, flops_right = self._forward_patch(batch_right, patch_w=w - w_half)
 
             del batch_right
             torch.cuda.empty_cache()
@@ -624,11 +877,15 @@ class Img2PointsSmallObjectDetection(nn.Module):
                 )
             # ==============================================================
 
+            runtime_merged = self._merge_runtime_dicts(runtime_left, runtime_right)
+            flops_merged = self._merge_runtime_dicts(flops_left, flops_right)
+            self._update_runtime_stats(runtime_merged, flops_merged)
+
             return [z_merged]
 
         else:
             # ========== 正常模式 (训练时或小图) ==========
-            z = self._forward_patch(batch, patch_w=w)
+            z, runtime_dict, flops_dict = self._forward_patch(batch, patch_w=w)
 
             # ====================== 计算采样率 ======================
             total_points   = b * t * h * w
@@ -637,7 +894,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
             z['sampling_rate'] = torch.tensor(sampling_rate, device=device)
 
             # ====================== 第一阶段检测质量指标 ======================
-            if not self.training and 'bboxes' in batch and False:
+            if not self.training and 'bboxes' in batch:
                 self._compute_and_print_stage1_metrics(
                     binary_mask=z['binary_mask'],
                     bboxes=batch['bboxes'],
@@ -646,14 +903,16 @@ class Img2PointsSmallObjectDetection(nn.Module):
                 )
             # ==============================================================
 
+            self._update_runtime_stats(runtime_dict, flops_dict)
+
             return [z]
     ################################################滑窗推理######################################################
 
-def I2PSOD_test(heads, image_size = [512,512], img_num = 20, layers=4, thresh=None,input_channels=1,feat_channels=[16,32,64],T_pooling=False,groups=2,downsample_mode='maxpool',net1name='UNet3D'):
+def I2PSOD_test(heads, image_size = [512,512], img_num = 20, layers=4, thresh=None,input_channels=1,feat_channels=[16,32,64],T_pooling=False,groups=2,downsample_mode='maxpool',net1name='UNet3D', opt=None):
     model =Img2PointsSmallObjectDetection(heads,  image_size = image_size, img_num = img_num, 
-                                          layers=layers, thresh=thresh, input_channels=input_channels,
+                                          layers=layers, thresh=thresh,
                                           feat_channels=feat_channels,T_pooling=T_pooling,
-                                          groups=groups,downsample_mode=downsample_mode,net1name=net1name)
+                                          groups=groups,downsample_mode=downsample_mode,net1name=net1name, opt=opt)
     return model
 
 
@@ -674,7 +933,7 @@ if __name__ == '__main__':
         # 初始化模型
         model = I2PSOD_test(
             heads=heads, image_size = [512, 512], img_num = 10, layers=3.61, thresh=3,net1name='UNet3DWithNormalConv3D',
-            feat_channels=[8,16,32,64], input_channels=1,
+            feat_channels=[8,16,32,64],
         ).to(device).eval()
         # print("\n=== 网络结构概要 ===")
         # print(model)  # 打印完整模型结构

@@ -4,10 +4,12 @@ import scipy.io as sio
 import os,sys 
 
 import xml.dom.minidom as doxml
-ROOT_DIR = "/root/autodl-tmp/Moving3.1"
-# 确保根目录在sys.path首位（覆盖默认的子目录）
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
+_cur = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
+    _cur = os.path.dirname(_cur)
+if _cur not in sys.path:
+    sys.path.insert(0, _cur)
 from lib.utils1.utils_eval import eval_metric
 
 def eval_func_final(results_dir_tol, data_dir=None, data_name=None, conf_ths = None, write_flag = True, 
