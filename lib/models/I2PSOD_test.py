@@ -22,6 +22,7 @@ from lib.utils1.bbox2binarymask import bboxes_to_binary_mask
 from lib.models.spconv_unet import UNetV2, UNetV2_3, UNetV2_2, UNetV2_3_32, UNetV2_3_T_nodown, UNetV2_3_T_nodown_maxpool, UNetV2_3_T_nodown_v2, UNetV2_3_T_nodown_v3
 from lib.models.spconv_utils import replace_feature, spconv
 from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D, EncoderOnlyConv3DProposalNet, TOSConvNet, TZSConvNet, DynamicTOSConvNet
+from lib.models.profile_utils import count_parameters, estimate_module_flops, estimate_sigmoid_flops, extract_feature_tensor
 from lib.utils1.show_one_img import show_one_img
 import torch
 
@@ -51,6 +52,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
             'sptial2d3',
         )
         self._component_param_cache = None
+        self._unclassified_param_count = 0
         self._runtime_frame_divisor = 1.0
         self._component_profile_printed = False
         self._component_profile_finalize_registered = False
@@ -73,6 +75,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
         # ==================================================
         # points generate net
         self.net1name=net1name
+        temporal_mode = getattr(opt, 'use_tzsconv', 'tzsconv')
         self.net1_feature_channels = feat_channels[0]
         if net1name=='UNet3DWithNormalConv3D':
             self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
@@ -89,17 +92,17 @@ class Img2PointsSmallObjectDetection(nn.Module):
         elif net1name=='TOSConvNet':
             self.I2PNet = TOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
-                                 use_final_conv=True, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 use_final_conv=True, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
         elif net1name in ('DynamicTOSConvNet', 'DynamicTOSconvNet'):
             self.I2PNet = DynamicTOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
-                                 use_final_conv=True, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 use_final_conv=True, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
         elif net1name in ('TZSConvNet', 'TZSconvNet'):
             self.I2PNet = TZSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
-                                 use_final_conv=True, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 use_final_conv=True, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
         else:
             print('net1name 错误！')
@@ -428,7 +431,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
         stats['Total'] = {
             'runtime': sum(stats[name]['runtime'] for name in self.runtime_component_names),
             'flops': sum(stats[name]['flops'] for name in self.runtime_component_names),
-            'params': sum(stats[name]['params'] for name in self.runtime_component_names),
+            'params': self.get_total_param_count(),
         }
         return stats
 
@@ -451,6 +454,8 @@ class Img2PointsSmallObjectDetection(nn.Module):
             f"  Total: runtime={total['runtime']:.6f}s  "
             f"FLOPs={total['flops']:.6f}  Params={total['params']}"
         )
+        if self._unclassified_param_count:
+            print(f"  UnclassifiedParams: {self._unclassified_param_count}")
         print('=' * 80)
         if mark_printed:
             self._component_profile_printed = True
@@ -489,7 +494,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
             if module_name == head or module_name.startswith(head + '.'):
                 return 'DetHead'
         if module_name == 'sigmoid' or module_name == 'conv_std' or module_name.startswith('conv_std.'):
-            return 'ACS'
+            return None
         return None
 
     def _classify_parameter_component(self, param_name):
@@ -503,17 +508,25 @@ class Img2PointsSmallObjectDetection(nn.Module):
                 return 'DetHead'
         if param_name == 'tau' or param_name.startswith('conv_std.'):
             return 'ACS'
-        return 'ACS'
+        return None
 
     def get_component_param_stats(self, refresh=False):
         if self._component_param_cache is not None and not refresh:
             return dict(self._component_param_cache)
         param_stats = {name: 0 for name in self.runtime_component_names}
+        unclassified = 0
         for param_name, param in self.named_parameters():
             component_name = self._classify_parameter_component(param_name)
+            if component_name is None:
+                unclassified += int(param.numel())
+                continue
             param_stats[component_name] += int(param.numel())
+        self._unclassified_param_count = unclassified
         self._component_param_cache = dict(param_stats)
         return param_stats
+
+    def get_total_param_count(self):
+        return count_parameters(self)
 
     @staticmethod
     def _sync_device(device):
@@ -553,81 +566,10 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
     @staticmethod
     def _extract_feature_tensor(obj):
-        if isinstance(obj, torch.Tensor):
-            return obj
-        if hasattr(obj, 'features') and isinstance(obj.features, torch.Tensor):
-            return obj.features
-        if isinstance(obj, (tuple, list)):
-            for item in obj:
-                tensor = Img2PointsSmallObjectDetection._extract_feature_tensor(item)
-                if tensor is not None:
-                    return tensor
-        return None
-
-    def _estimate_conv_flops(self, module, output):
-        out_tensor = self._extract_feature_tensor(output)
-        if out_tensor is None:
-            return 0.0
-        if not hasattr(module, 'in_channels') or not hasattr(module, 'out_channels'):
-            return 0.0
-        kernel_size = getattr(module, 'kernel_size', 1)
-        weight = getattr(module, 'weight', None)
-        if isinstance(kernel_size, int):
-            if weight is not None and hasattr(weight, 'dim') and weight.dim() >= 3:
-                kernel_volume = kernel_size ** max(weight.dim() - 2, 1)
-            else:
-                kernel_volume = kernel_size
-        else:
-            kernel_volume = math.prod(kernel_size)
-        groups = max(int(getattr(module, 'groups', 1)), 1)
-        out_channels = max(int(getattr(module, 'out_channels', 1)), 1)
-        if hasattr(output, 'features'):
-            active_points = int(out_tensor.shape[0])
-        else:
-            active_points = int(out_tensor.numel() // out_channels)
-        in_channels = int(getattr(module, 'in_channels', 1))
-        flops = 2.0 * active_points * out_channels * (in_channels / groups) * kernel_volume
-        if getattr(module, 'bias', None) is not None:
-            flops += active_points * out_channels
-        return float(flops)
-
-    def _estimate_attention_flops(self, module, inputs):
-        if not inputs:
-            return 0.0
-        x = inputs[0]
-        if not hasattr(x, 'features'):
-            return 0.0
-        features = x.features
-        if features.dim() != 2:
-            return 0.0
-        num_points, channels = features.shape
-        kernel_size = int(getattr(module, 'k', 1))
-        k2 = kernel_size * kernel_size
-        flops = 0.0
-        flops += 4.0 * num_points * channels
-        flops += 4.0 * num_points * k2 * channels
-        flops += 8.0 * num_points * k2
-        flops += max(k2 - 1, 0) * num_points
-        flops += 3.0 * num_points * channels
-        flops += 6.0 * num_points
-        flops += 3.0 * num_points * channels
-        return float(flops)
+        return extract_feature_tensor(obj)
 
     def _estimate_module_flops(self, module, inputs, output):
-        class_name = module.__class__.__name__
-        if 'SparseSymmetricCosineAttention' in class_name:
-            return self._estimate_attention_flops(module, inputs)
-        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            out_tensor = self._extract_feature_tensor(output)
-            return float(2 * out_tensor.numel()) if out_tensor is not None else 0.0
-        if isinstance(module, (nn.ReLU, nn.ReLU6, nn.LeakyReLU)):
-            out_tensor = self._extract_feature_tensor(output)
-            return float(out_tensor.numel()) if out_tensor is not None else 0.0
-        if isinstance(module, nn.Sigmoid):
-            return 0.0
-        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)) or 'Conv' in class_name:
-            return self._estimate_conv_flops(module, output)
-        return 0.0
+        return estimate_module_flops(module, inputs, output)
 
     def _start_flops_capture(self):
         if not self._flops_enabled():
@@ -658,7 +600,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
     @staticmethod
     def _estimate_sigmoid_flops(tensor):
-        return float(tensor.numel() * 4.0)
+        return estimate_sigmoid_flops(tensor)
 
     def _estimate_acs_flops(self, soft_mask):
         if soft_mask is None:
@@ -920,7 +862,7 @@ def I2PSOD_test(heads, image_size = [512,512], img_num = 20, layers=4, thresh=No
 if __name__ == '__main__':
     import time
     import torch
-    from thop import profile
+    from lib.models.profile_utils import profile_model
     import sys
     
     # 设置设备
@@ -932,11 +874,11 @@ if __name__ == '__main__':
         print(f"\n=== 测试上采样模式: {upsample_mode} ===")
         # 初始化模型
         model = I2PSOD_test(
-            heads=heads, image_size = [512, 512], img_num = 10, layers=3.61, thresh=3,net1name='UNet3DWithNormalConv3D',
-            feat_channels=[8,16,32,64],
+            heads=heads, image_size = [512, 512], img_num = 10, layers=3.61, thresh=3,net1name='TOSConvNet',
+            feat_channels=[16, 16],
         ).to(device).eval()
-        # print("\n=== 网络结构概要 ===")
-        # print(model)  # 打印完整模型结构
+        print("\n=== 网络结构概要 ===")
+        print(model)  # 打印完整模型结构
         # 测试输入：[B, C, D, H, W] = [1, 3, 5, 512, 512]（D=5为时间维度）
         test_input = torch.randn(1, 3, 10, 512, 512).to(device)  # 移除过时的Variable
         batch = {'input': test_input}
@@ -954,13 +896,10 @@ if __name__ == '__main__':
         print(f"推理耗时: {infer_time:.4f}s")
         # assert output.shape[2] == test_input.shape[2], "时间维度（D）尺寸被错误修改！"
 
-        # # 参数量/计算量计算（thop）
-        if profile is not None:
-            flops, params = profile(model, inputs=(batch,), verbose=False)
-            # Params 通常以 M (Million) 为单位
-            print(f"Total Parameters: {params / 1e6:.8f} M") 
-            # FLOPs 通常以 G (Billion) 为单位
-            print(f"Total FLOPs (MACs): {flops / 1e9:.8f} G")
+        model.eval()
+        flops, params, _ = profile_model(model, inputs=(batch,))
+        print(f"Total Parameters: {params / 1e6:.8f} M")
+        print(f"Total FLOPs (MACs): {flops / 1e9:.8f} G")
         # else:
         # from fvcore.nn import FlopCountAnalysis, parameter_count_table
 

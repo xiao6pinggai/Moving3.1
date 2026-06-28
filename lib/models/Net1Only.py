@@ -28,6 +28,7 @@ class Net1Only(nn.Module):
         super().__init__()
         # points generate net
         self.net1name=net1name
+        temporal_mode = getattr(opt, 'use_tzsconv', 'tzsconv')
         if net1name=='UNet3DWithNormalConv3D': # 实际使用
             self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=False,TConvOnly=False)
@@ -40,17 +41,17 @@ class Net1Only(nn.Module):
         elif net1name=='TOSConvNet':
             self.I2PNet = TOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
-                                 use_final_conv=False, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 use_final_conv=False, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
         elif net1name in ('DynamicTOSConvNet', 'DynamicTOSconvNet'):
             self.I2PNet = DynamicTOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
-                                 use_final_conv=False, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 use_final_conv=False, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
         elif net1name in ('TZSConvNet', 'TZSconvNet'):
             self.I2PNet = TZSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
-                                 use_final_conv=False, use_tzsconv=getattr(opt, 'use_tzsconv', True),
+                                 use_final_conv=False, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
         else:
             print('net1name 错误！')
@@ -225,7 +226,7 @@ def Net1(heads, image_size = [512,512], img_num = 20, layers=4, thresh=None,inpu
 if __name__ == '__main__':
     import time
     import torch
-    from thop import profile
+    from lib.models.profile_utils import profile_model
     import sys
     
     # 设置设备
@@ -259,13 +260,10 @@ if __name__ == '__main__':
         print(f"推理耗时: {infer_time:.4f}s")
         # assert output.shape[2] == test_input.shape[2], "时间维度（D）尺寸被错误修改！"
 
-        # # 参数量/计算量计算（thop）
-        if profile is not None:
-            flops, params = profile(model, inputs=(batch,), verbose=False)
-            # Params 通常以 M (Million) 为单位
-            print(f"Total Parameters: {params / 1e6:.8f} M") 
-            # FLOPs 通常以 G (Billion) 为单位
-            print(f"Total FLOPs (MACs): {flops / 1e9:.8f} G")
+        model.eval()
+        flops, params, _ = profile_model(model, inputs=(batch,))
+        print(f"Total Parameters: {params / 1e6:.8f} M")
+        print(f"Total FLOPs (MACs): {flops / 1e9:.8f} G")
         # else:
         # from fvcore.nn import FlopCountAnalysis, parameter_count_table
 

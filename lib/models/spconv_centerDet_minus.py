@@ -125,12 +125,8 @@ def sp_centerDet_minus(heads, image_size = [512,512], img_num = 20, layers=4, th
 if __name__ == '__main__':
     import time
     import torch
-    try:
-        from thop import profile, clever_format
-    except ImportError:
-        print("提示：未安装thop（pip install thop），跳过参数量/计算量计算")
-        profile = None
-    
+    from lib.models.profile_utils import profile_model
+
     # 设置设备
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
@@ -159,16 +155,8 @@ if __name__ == '__main__':
     print(f"推理耗时: {infer_time:.4f}s")
     # assert output.shape[2] == test_input.shape[2], "时间维度（D）尺寸被错误修改！"
 
-    # 参数量/计算量计算（thop）
-    if profile is not None:
-        flops, params = profile(model, inputs=(batch,), verbose=False)
-        # Params 通常以 M (Million) 为单位
-        print(f"Total Parameters: {params / 1e6:.8f} M") 
-        # FLOPs 通常以 G (Billion) 为单位
-        print(f"Total FLOPs (MACs): {flops / 1e9:.8f} G")
+    model.eval()
+    flops, params, _ = profile_model(model, inputs=(batch,))
+    print(f"Total Parameters: {params / 1e6:.8f} M")
+    print(f"Total FLOPs (MACs): {flops / 1e9:.8f} G")
         
-        # 网络结构打印（简易版，替代torchsummaryX）
-        
-        # 可选：仅打印层结构统计
-        # total_layers = sum(1 for _ in model.named_modules() if not isinstance(getattr(model, _.split('.')[0]), Module) or _.count('.') == 0)
-        # print(f"模型总层数（顶层）: {total_layers}")

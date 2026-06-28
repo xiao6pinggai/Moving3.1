@@ -15,6 +15,7 @@ from lib.models.TOSConv import TOSConv
 from lib.models.TOSConv_once_conv_masked import TOSConv_once_conv_masked
 from lib.models.TZSLinear import TZSLinear
 from lib.models.DynamicTOSConv import DynamicTOSConv
+from lib.models.tmf import TMF
 
 # ==========================================
 # 基础组件定义
@@ -891,12 +892,12 @@ class LightWeightedConv3D(Module):
 
 
 class TOSConvNet(Module):
-    """3x3x3 Conv-BN-ReLU stack with an optional temporal sum-one background branch."""
+    """3x3x3 Conv-BN-ReLU stack with an optional temporal background branch."""
 
     def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
                  residual=None, upsample_mode="trilinear", dropout_prob=0,
                  activation=None, T_pooling=True, groups=2,
-                 downsample_mode="stride", use_final_conv=True, use_tzsconv=True,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv='',
                  seq_len=10):
         super().__init__()
         self.use_final_conv = use_final_conv
@@ -904,8 +905,19 @@ class TOSConvNet(Module):
         stages = []
 
         self.background_conv = None
-        if self.use_tzsconv:
+        if self.use_tzsconv == 'tzsconv':
             self.background_conv = TOSConv(
+                num_channels,
+                num_channels,
+                kernel_size=(seq_len, 1, 1),
+                stride=1,
+                padding=(0, 0, 0),
+                bias=False,
+                skip_add=False,
+                groups=num_channels
+            )
+        elif self.use_tzsconv == 'tmf':
+            self.background_conv = TMF(
                 num_channels,
                 num_channels,
                 kernel_size=(seq_len, 1, 1),
@@ -918,7 +930,7 @@ class TOSConvNet(Module):
         in_channels = num_channels
         for stage_idx, out_channels in enumerate(feat_channels):
             stage_in_channels = in_channels
-            if self.use_tzsconv and stage_idx == 0:
+            if self.background_conv is not None and stage_idx == 0:
                 stage_in_channels = in_channels * 2
             stages.append(nn.Sequential(
                 Conv3d(stage_in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
@@ -956,7 +968,7 @@ class TZSConvNet(Module):
     def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
                  residual=None, upsample_mode="trilinear", dropout_prob=0,
                  activation=None, T_pooling=True, groups=2,
-                 downsample_mode="stride", use_final_conv=True, use_tzsconv=True,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv='tzsconv',
                  seq_len=10):
         super().__init__()
         self.use_final_conv = use_final_conv
@@ -965,7 +977,7 @@ class TZSConvNet(Module):
         stages = []
 
         self.forward_conv = None
-        if self.use_tzsconv:
+        if self.use_tzsconv == 'tzsconv':
             self.forward_conv = TZSLinear(
                 num_channels,
                 num_channels,
@@ -979,7 +991,7 @@ class TZSConvNet(Module):
         in_channels = num_channels
         for stage_idx, out_channels in enumerate(feat_channels):
             stage_in_channels = in_channels
-            if self.use_tzsconv and stage_idx == 0:
+            if self.forward_conv is not None and stage_idx == 0:
                 stage_in_channels = in_channels * 2
             stages.append(nn.Sequential(
                 Conv3d(stage_in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
@@ -1014,7 +1026,7 @@ class DynamicTOSConvNet(Module):
     def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
                  residual=None, upsample_mode="trilinear", dropout_prob=0,
                  activation=None, T_pooling=True, groups=2,
-                 downsample_mode="stride", use_final_conv=True, use_tzsconv=True,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv='tzsconv',
                  seq_len=10):
         super().__init__()
         self.use_final_conv = use_final_conv
@@ -1023,7 +1035,7 @@ class DynamicTOSConvNet(Module):
         stages = []
 
         self.background_conv = None
-        if self.use_tzsconv:
+        if self.use_tzsconv == 'tzsconv':
             self.background_conv = DynamicTOSConv(
                 num_channels,
                 num_channels,
@@ -1037,7 +1049,7 @@ class DynamicTOSConvNet(Module):
         in_channels = num_channels
         for stage_idx, out_channels in enumerate(feat_channels):
             stage_in_channels = in_channels
-            if self.use_tzsconv and stage_idx == 0:
+            if self.background_conv is not None and stage_idx == 0:
                 stage_in_channels = in_channels * 2
             stages.append(nn.Sequential(
                 Conv3d(stage_in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
