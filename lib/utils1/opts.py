@@ -18,7 +18,7 @@ class opts(object):
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3
         self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3
-        self.parser.add_argument('--load_model', default= '',
+        self.parser.add_argument('--load_model', default= 'weights/rs_car_new_multi/I2PSOD/v16_001_003_supMode_0_seglen10_weights2026_06_29_17_05_13/model_best_dis_f1_best.pth',
                                  help='path to pretrained model')
         self.parser.add_argument('--resume', type=bool, default=True, help='resume an experiment.')
         self.parser.add_argument('--down_ratio', type=int, default=1, help='output stride. Currently only supports for 1.')

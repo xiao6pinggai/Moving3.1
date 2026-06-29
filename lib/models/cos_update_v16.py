@@ -3,12 +3,16 @@ import torch.nn as nn
 
 
 class TripletMotionConsistencySparseConv(nn.Module):
-    """Triplet motion consistency update for sparse spatio-temporal points.
+    """稀疏时空点的三帧运动一致性更新模块。
 
-    The module keeps sparse coordinates unchanged and updates only point
-    features. Neighbor search is window-restricted top-k within the same batch
-    and adjacent temporal frame. Points without both previous and next
-    neighbors receive an exact identity output.
+    改动点：
+    1. top-k 邻居搜索改为真正的窗口内查找，不再对整帧候选点做 dense pairwise distance。
+    2. 去掉 GPU -> CPU 的 .item() / .cpu() / .tolist() 同步。
+    3. 使用窗口 offset + hash key + searchsorted 做 CUDA 并行查找。
+    4. 只对具有 previous-next 有效 triplet 的点计算三元特征与 FFN。
+    5. FFN 放在 “三元特征 * 位置门控” 之后。
+    6. BatchNorm1d 改为 LayerNorm。
+    7. 去掉 self.alpha 对输出的作用。
     """
 
     def __init__(
@@ -28,16 +32,18 @@ class TripletMotionConsistencySparseConv(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        del kernel_size, kwargs
+        del kernel_size, chunk_size, kwargs
+
         self.in_channels = in_channels
+
+        # 保留 alpha 属性以兼容旧接口，但 forward 中不再使用。
         self.alpha = alpha
+
         self.temporal_dilation = int(temporal_dilation)
         self.topk = max(1, int(topk))
         self.window_size = max(1, int(window_size))
         self.window_radius = self.window_size // 2
         self.pos_scale = float(pos_scale)
-        self.chunk_size = int(chunk_size)
-        self.auto_pair_limit = 16 * 1024 * 1024
         self.valid_norm = bool(valid_norm)
         self.conv = conv if conv is not None else nn.Identity()
 
@@ -53,129 +59,254 @@ class TripletMotionConsistencySparseConv(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(pos_hidden, 1),
         )
+
         self.ffn = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, in_channels),
         )
-        self.bn = nn.BatchNorm1d(in_channels, eps=1e-3, momentum=0.01)
+
+        # 用 LayerNorm 替代 BatchNorm1d，避免无效点污染 batch 统计。
+        self.norm = nn.LayerNorm(in_channels)
         self.act = nn.ReLU(inplace=True)
 
-        # Start with neutral relative-position modulation: 2 * sigmoid(0) = 1.
+        # 初始位置门控保持中性：2 * sigmoid(0) = 1。
         nn.init.zeros_(self.pos_mlp[-1].weight)
         nn.init.zeros_(self.pos_mlp[-1].bias)
 
-    def _build_frame_groups(self, indices):
-        b = indices[:, 0].long()
-        t = indices[:, 1].long()
-        frame_stride = int(t.max().item()) + self.temporal_dilation + 2
-        frame_keys = b * frame_stride + t
-        unique_keys = torch.unique(frame_keys, sorted=False)
-        groups = {}
-        for key in unique_keys.detach().cpu().tolist():
-            key_tensor = frame_keys.new_tensor(key)
-            groups[int(key)] = (frame_keys == key_tensor).nonzero(as_tuple=False).squeeze(1)
-        return groups, frame_stride
+        # 预先构造窗口内 offset，并按距离从近到远排序。
+        # 后续只需要保留前 K 个有效 offset，即是真正窗口内 top-k。
+        coords = torch.arange(
+            -self.window_radius,
+            self.window_radius + 1,
+            dtype=torch.long,
+        )
+        oy, ox = torch.meshgrid(coords, coords, indexing="ij")
+        offsets = torch.stack([oy.reshape(-1), ox.reshape(-1)], dim=1)
+        dist2 = offsets[:, 0].square() + offsets[:, 1].square()
+        order = torch.argsort(dist2, stable=True)
 
-    def _fill_topk(self, query_idx, cand_idx, spatial, out_idx, out_mask):
-        if query_idx.numel() == 0 or cand_idx.numel() == 0:
-            return
+        self.register_buffer("window_offsets", offsets[order], persistent=False)
+        self.register_buffer("window_dist2", dist2[order], persistent=False)
 
-        k_eff = min(self.topk, int(cand_idx.numel()))
-        query_xy = spatial[query_idx].float()
-        cand_xy = spatial[cand_idx].float()
-        if self.chunk_size > 0:
-            step = self.chunk_size
-        else:
-            step = max(1, self.auto_pair_limit // max(1, int(cand_idx.numel())))
-            step = min(step, int(query_idx.numel()))
-        radius = float(self.window_radius)
-        inf = torch.tensor(float("inf"), device=query_xy.device, dtype=query_xy.dtype)
-        cand_y = cand_xy[:, 0].unsqueeze(0)
-        cand_x = cand_xy[:, 1].unsqueeze(0)
-
-        for start in range(0, query_idx.numel(), step):
-            end = min(start + step, query_idx.numel())
-            q_xy = query_xy[start:end]
-            dy = q_xy[:, 0].unsqueeze(1) - cand_y
-            dx = q_xy[:, 1].unsqueeze(1) - cand_x
-            in_window = (dy.abs() <= radius) & (dx.abs() <= radius)
-            dist2 = dy.square() + dx.square()
-            dist2 = dist2.masked_fill(~in_window, inf)
-            top_dist2, top_pos = torch.topk(dist2, k=k_eff, dim=1, largest=False)
-            rows = query_idx[start:end]
-            out_idx[rows, :k_eff] = cand_idx[top_pos]
-            out_mask[rows, :k_eff] = torch.isfinite(top_dist2)
+    @staticmethod
+    def _encode_key(b, t, y, x, t_stride, y_stride, x_stride):
+        """把 batch/time/y/x 编码成一维 key，用于 CUDA 上的排序和查找。"""
+        return (((b * t_stride + t) * y_stride + y) * x_stride + x)
 
     def _find_triplet_neighbors(self, indices):
-        n_points = indices.shape[0]
+        """真正的窗口内 top-k 邻居查找。
+
+        输入:
+            indices: [N, 4], 格式为 [batch, time, y, x]
+
+        输出:
+            idx_prev:  [N, K]
+            idx_next:  [N, K]
+            mask_prev: [N, K]
+            mask_next: [N, K]
+
+        计算方式:
+            1. 对所有稀疏点坐标编码成 hash key。
+            2. 对 key 排序。
+            3. 对每个点并行枚举窗口内所有 offset。
+            4. 使用 searchsorted 查找 previous / next 帧中对应坐标是否存在。
+            5. offset 已按距离排序，因此前 K 个有效匹配就是窗口内 top-k。
+        """
         device = indices.device
-        idx_prev = torch.zeros(n_points, self.topk, dtype=torch.long, device=device)
-        idx_next = torch.zeros(n_points, self.topk, dtype=torch.long, device=device)
-        mask_prev = torch.zeros(n_points, self.topk, dtype=torch.bool, device=device)
-        mask_next = torch.zeros(n_points, self.topk, dtype=torch.bool, device=device)
+        n_points = indices.shape[0]
+        k = self.topk
 
-        groups, _ = self._build_frame_groups(indices)
-        spatial = indices[:, 2:4]
+        coords = indices.long()
+        b = coords[:, 0]
+        t = coords[:, 1]
+        y = coords[:, 2]
+        x = coords[:, 3]
 
-        for key, query_idx in groups.items():
-            prev_idx = groups.get(key - self.temporal_dilation)
-            next_idx = groups.get(key + self.temporal_dilation)
-            if prev_idx is not None:
-                self._fill_topk(query_idx, prev_idx, spatial, idx_prev, mask_prev)
-            if next_idx is not None:
-                self._fill_topk(query_idx, next_idx, spatial, idx_next, mask_next)
+        # stride 全部保留为 CUDA tensor，避免 .item() 触发 GPU/CPU 同步。
+        t_stride = t.max() + self.temporal_dilation + 3
+        y_stride = y.max() + self.window_radius + 3
+        x_stride = x.max() + self.window_radius + 3
+
+        all_keys = self._encode_key(
+            b=b,
+            t=t,
+            y=y,
+            x=x,
+            t_stride=t_stride,
+            y_stride=y_stride,
+            x_stride=x_stride,
+        )
+
+        # 对所有已有 sparse 坐标建立可搜索的一维 key 表。
+        sorted_keys, sorted_order = torch.sort(all_keys)
+
+        offsets = self.window_offsets.to(device=device)
+        off_y = offsets[:, 0]
+        off_x = offsets[:, 1]
+        n_offsets = offsets.shape[0]
+
+        # 同时构造 previous 和 next 两个方向的目标坐标。
+        target_t = torch.stack(
+            [
+                t - self.temporal_dilation,
+                t + self.temporal_dilation,
+            ],
+            dim=1,
+        ).view(n_points, 2, 1)
+
+        target_b = b.view(n_points, 1, 1)
+        target_y = y.view(n_points, 1, 1) + off_y.view(1, 1, n_offsets)
+        target_x = x.view(n_points, 1, 1) + off_x.view(1, 1, n_offsets)
+
+        target_keys = self._encode_key(
+            b=target_b,
+            t=target_t,
+            y=target_y,
+            x=target_x,
+            t_stride=t_stride,
+            y_stride=y_stride,
+            x_stride=x_stride,
+        )
+
+        flat_target_keys = target_keys.reshape(-1)
+
+        # CUDA 并行二分查找：每个目标窗口坐标查一次是否存在。
+        pos = torch.searchsorted(sorted_keys, flat_target_keys)
+        pos_safe = pos.clamp_max(n_points - 1)
+
+        matched_keys = sorted_keys[pos_safe]
+        matched_mask = (pos < n_points) & (matched_keys == flat_target_keys)
+        matched_index = sorted_order[pos_safe]
+
+        matched_mask = matched_mask.view(n_points, 2, n_offsets)
+        matched_index = matched_index.view(n_points, 2, n_offsets)
+
+        # offsets 已经按距离升序排列。
+        # 对每个点、每个方向，前 K 个有效匹配就是窗口内 top-k。
+        rank = matched_mask.long().cumsum(dim=-1) - 1
+        keep = matched_mask & (rank < k)
+
+        out_idx = torch.zeros(n_points, 2, k, dtype=torch.long, device=device)
+        out_mask = torch.zeros(n_points, 2, k, dtype=torch.bool, device=device)
+
+        row_ids = torch.arange(n_points, device=device).view(n_points, 1, 1)
+        row_ids = row_ids.expand(n_points, 2, n_offsets)
+
+        dir_ids = torch.arange(2, device=device).view(1, 2, 1)
+        dir_ids = dir_ids.expand(n_points, 2, n_offsets)
+
+        out_idx[row_ids[keep], dir_ids[keep], rank[keep]] = matched_index[keep]
+        out_mask[row_ids[keep], dir_ids[keep], rank[keep]] = True
+
+        idx_prev = out_idx[:, 0]
+        idx_next = out_idx[:, 1]
+        mask_prev = out_mask[:, 0]
+        mask_next = out_mask[:, 1]
 
         return idx_prev, idx_next, mask_prev, mask_next
 
     def forward(self, x):
         input_features = x.features
+
         if input_features.numel() == 0:
             return input_features, input_features.new_zeros((input_features.shape[0], 1))
 
         x_conv = self.conv(x)
         indices = x_conv.indices
         features = x_conv.features
-        n_points, channels = features.shape
 
+        n_points, channels = features.shape
+        k = self.topk
+
+        # 1. 真正窗口内 top-k previous / next 邻居查找。
         idx_prev, idx_next, mask_prev, mask_next = self._find_triplet_neighbors(indices)
+
+        # 2. 构造 previous-next triplet 的有效 mask。
+        # mask_pair[i, u, v] 表示第 i 个点的第 u 个 prev 和第 v 个 next 是否同时有效。
         mask_pair = mask_prev.unsqueeze(2) & mask_next.unsqueeze(1)
         has_pair = mask_pair.flatten(1).any(dim=1)
-        if not has_pair.any():
-            return input_features, input_features.new_zeros((n_points, 1))
 
-        prev_feat = self.prev_proj(features)[idx_prev]
-        cur_feat = self.cur_proj(features).view(n_points, 1, 1, channels)
-        next_feat = self.next_proj(features)[idx_next]
-        triplet_feat = prev_feat.unsqueeze(2) + cur_feat + next_feat.unsqueeze(1)
+        # 只对存在合法 triplet 的点计算后续三元特征，减少无效 FFN 计算。
+        valid_idx = has_pair.nonzero(as_tuple=False).squeeze(1)
 
-        triplet_msg = self.ffn(triplet_feat.reshape(-1, channels)).view(
-            n_points, self.topk, self.topk, channels
+        idx_prev_v = idx_prev[valid_idx]
+        idx_next_v = idx_next[valid_idx]
+        mask_pair_v = mask_pair[valid_idx]
+
+        n_valid = valid_idx.shape[0]
+
+        # 3. 只投影参与有效更新的点及其邻居。
+        prev_feat = self.prev_proj(features[idx_prev_v.reshape(-1)]).view(n_valid, k, channels)
+        cur_feat = self.cur_proj(features[valid_idx]).view(n_valid, 1, 1, channels)
+        next_feat = self.next_proj(features[idx_next_v.reshape(-1)]).view(n_valid, k, channels)
+
+        # 4. 构造三元特征。
+        # z_{iuv} = Wp h_prev + Wc h_cur + Wn h_next
+        triplet_feat = (
+            prev_feat.unsqueeze(2)
+            + cur_feat
+            + next_feat.unsqueeze(1)
         )
 
+        # 5. 构造基于运动一致性的 6 维位置编码。
+        # Δ- = current - previous
+        # Δ+ = next - current
+        # acc = Δ+ - Δ- = next - 2 * current + previous
         spatial = indices[:, 2:4].to(features.dtype)
-        s_cur = spatial.view(n_points, 1, 1, 2)
-        s_prev = spatial[idx_prev].unsqueeze(2)
-        s_next = spatial[idx_next].unsqueeze(1)
-        s_minus = (s_cur - s_prev).expand(-1, -1, self.topk, -1)
-        s_plus = (s_next - s_cur).expand(-1, self.topk, -1, -1)
+
+        s_cur = spatial[valid_idx].view(n_valid, 1, 1, 2)
+        s_prev = spatial[idx_prev_v].unsqueeze(2)
+        s_next = spatial[idx_next_v].unsqueeze(1)
+
+        s_minus = (s_cur - s_prev).expand(-1, -1, k, -1)
+        s_plus = (s_next - s_cur).expand(-1, k, -1, -1)
         accel = s_plus - s_minus
-        motion_input = torch.cat([s_minus, s_plus, accel], dim=-1) / max(self.pos_scale, 1e-6)
 
-        pos_score = self.pos_mlp(motion_input.reshape(-1, 6)).view(n_points, self.topk, self.topk, 1)
+        motion_input = torch.cat(
+            [s_minus, s_plus, accel],
+            dim=-1,
+        ) / max(self.pos_scale, 1e-6)
+
+        # 6. 位置编码生成 scalar gate。
+        # 初始时 pos_gate ≈ 1，训练后根据运动一致性调制三元特征。
+        pos_score = self.pos_mlp(motion_input.reshape(-1, 6))
+        pos_score = pos_score.view(n_valid, k, k, 1)
+
         pos_gate = 2.0 * torch.sigmoid(pos_score)
-        pos_gate = pos_gate * mask_pair.unsqueeze(-1).to(pos_gate.dtype)
+        pos_gate = pos_gate * mask_pair_v.unsqueeze(-1).to(pos_gate.dtype)
 
-        mod_msg = triplet_msg * pos_gate
-        msg_sum = mod_msg.sum(dim=2).sum(dim=1)
+        # 7. 按你的要求：FFN 放在 “三元特征 * 位置编码” 之后。
+        # 注意 FFN 有 bias，因此 FFN 后仍然乘一次 mask，保证无效 triplet 不产生贡献。
+        triplet_input = triplet_feat * pos_gate
+
+        triplet_msg = self.ffn(triplet_input.reshape(-1, channels))
+        triplet_msg = triplet_msg.view(n_valid, k, k, channels)
+        triplet_msg = triplet_msg * mask_pair_v.unsqueeze(-1).to(triplet_msg.dtype)
+
+        # 8. 对 K × K 个 triplet message 聚合。
+        msg_sum = triplet_msg.sum(dim=2).sum(dim=1)
+
         if self.valid_norm:
-            denom = mask_pair.flatten(1).sum(dim=1).to(features.dtype).clamp_min(1.0).unsqueeze(1)
+            denom = mask_pair_v.flatten(1).sum(dim=1)
+            denom = denom.to(features.dtype).clamp_min(1.0).unsqueeze(1)
         else:
-            denom = features.new_full((n_points, 1), float(self.topk * self.topk))
-        update = msg_sum / denom
-        update = self.act(self.bn(update))
-        update = update * has_pair.to(update.dtype).unsqueeze(1)
+            denom = features.new_full((n_valid, 1), float(k * k))
 
-        score = pos_gate.sum(dim=2).sum(dim=1) / denom.to(pos_gate.dtype)
-        score = score * has_pair.to(score.dtype).unsqueeze(1)
-        return input_features + self.alpha * update, score
+        update_v = msg_sum / denom
+
+        # 9. 使用 LayerNorm 替代 BatchNorm。
+        update_v = self.act(self.norm(update_v))
+
+        # 10. 写回完整 N 个点的 update。
+        update = features.new_zeros(n_points, channels)
+        update[valid_idx] = update_v
+
+        # 11. score 表示有效 triplet 的平均位置门控强度。
+        score_v = pos_gate.sum(dim=2).sum(dim=1) / denom.to(pos_gate.dtype)
+
+        score = features.new_zeros(n_points, 1)
+        score[valid_idx] = score_v
+
+        # 12. 去掉 self.alpha 的作用，直接 residual update。
+        return input_features + update, score
