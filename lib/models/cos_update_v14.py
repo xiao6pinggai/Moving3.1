@@ -29,8 +29,8 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         self,
         in_channels,
         num_frames=5,
-        num_traj=16,
-        topk=2,
+        num_traj=32,
+        topk=None,
         window_size=256,
         num_heads=4,
         alpha=0.5,
@@ -47,10 +47,11 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        if topk < 1:
-            raise ValueError(f"topk must be >= 1, got {topk}")
-        if topk > num_traj:
-            raise ValueError(f"topk must be <= num_traj, got topk={topk}, num_traj={num_traj}")
+        if topk is not None:
+            if topk < 1:
+                raise ValueError(f"topk must be >= 1, got {topk}")
+            if topk > num_traj:
+                raise ValueError(f"topk must be <= num_traj, got topk={topk}, num_traj={num_traj}")
         if assignment_temperature <= 0:
             raise ValueError(
                 f"assignment_temperature must be > 0, got {assignment_temperature}"
@@ -99,6 +100,8 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         self.read_q_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.read_k_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.read_v_proj = nn.Linear(in_channels, in_channels, bias=False)
+        # context-only 模式下的逐点通道投影，等价于 sparse 1x1x1。
+        self.out_proj = nn.Linear(in_channels, in_channels, bias=False)
 
         self.temporal_attn = nn.MultiheadAttention(
             embed_dim=in_channels,
@@ -116,6 +119,7 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
 
         nn.init.eye_(self.feat_proj.weight)
         nn.init.eye_(self.read_v_proj.weight)
+        nn.init.eye_(self.out_proj.weight)
         nn.init.xavier_uniform_(self.read_q_proj.weight)
         nn.init.xavier_uniform_(self.read_k_proj.weight)
 
@@ -244,21 +248,28 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         返回：
         token:      [M, C]，每个 slot 聚合后的 token。
         valid:      [M]，该 slot 是否聚合到足够质量/数量的点。
-        assign_idx: [N_frame, topk]，每个点分配到的 topk slots。
-        assign_val: [N_frame, topk]，对应分配权重。
+        assign_idx: [N_frame, K]，每个点分配到的 slots。
+        assign_val: [N_frame, K]，对应分配权重；topk=None 时 K=M。
         """
         n_frame = k_frame.shape[0]
         m_count = self.num_traj
-        k_count = self.topk
+        k_count = m_count if self.topk is None else self.topk
         scale = math.sqrt(k_frame.shape[1])
 
         logits = q_frame @ k_frame.T / scale
         logits = logits / self.assignment_temperature
         assign = torch.softmax(logits.float(), dim=0).to(dtype)
-        top_val, top_idx = torch.topk(assign, k=k_count, dim=0)
-
-        assign_idx = top_idx.transpose(0, 1).contiguous()
-        assign_val = top_val.transpose(0, 1).contiguous()
+        if self.topk is None:
+            assign_idx = torch.arange(
+                m_count,
+                device=k_frame.device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(n_frame, m_count)
+            assign_val = assign.transpose(0, 1).contiguous()
+        else:
+            top_val, top_idx = torch.topk(assign, k=k_count, dim=0)
+            assign_idx = top_idx.transpose(0, 1).contiguous()
+            assign_val = top_val.transpose(0, 1).contiguous()
 
         slot_idx = assign_idx.reshape(-1)
         slot_w = assign_val.reshape(-1, 1)
@@ -349,7 +360,7 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         C: 通道数。
         L: num_frames，也就是 opt.seqLen 传进来的帧数。
         M: num_traj，局部窗口内 object slots 数量。
-        K: topk，每个点分配给 K 个 object slots。
+        K: 实际参与写回的 slots 数量；topk=None 时 K=M，不再做 top-R 约束。
         """
         residual = x.features
         features = x.features
@@ -365,7 +376,7 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         dtype = features.dtype
         l_count = self.num_frames
         m_count = self.num_traj
-        k_count = self.topk
+        k_count = m_count if self.topk is None else self.topk
         channels = features.shape[1]
         scale = math.sqrt(channels)
 
@@ -404,7 +415,15 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
         logits = (q_points * k_all[:, None, :]).sum(dim=-1) / scale
         logits = logits / self.assignment_temperature
         assign = torch.softmax(logits.float(), dim=1).to(dtype)
-        assign_val, assign_idx = torch.topk(assign, k=k_count, dim=1)
+        if self.topk is None:
+            assign_idx = torch.arange(
+                m_count,
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(features_w.shape[0], m_count)
+            assign_val = assign
+        else:
+            assign_val, assign_idx = torch.topk(assign, k=k_count, dim=1)
 
         # target 把 (cube, frame, slot) 压成一维编号。
         # 通过 index_add_，所有点可以一次性累加到对应 object slot token 上。
@@ -446,11 +465,12 @@ class ObjectCentricAssociationTokenFusion(nn.Module):
             k_count,
             channels,
         )
-        # 写回：每个点只读取自己所在 (cube, frame) 的 topk slots，并按分配权重加权求和。
+        # 写回：每个点读取自己所在 (cube, frame) 的 K 个 slots，并按分配权重加权求和。
         context = (selected_tokens * assign_val.unsqueeze(-1)).sum(dim=1)
 
         # 保持稀疏坐标不变，只更新 features；score 主要用于可视化/调试响应强度。
-        out[work_idx] = residual_w + self.alpha * context
+        # out[work_idx] = residual_w + self.alpha * context
+        out[work_idx] = self.out_proj(context)
         score[work_idx] = assign_val.max(dim=1, keepdim=True).values
 
         return out, score

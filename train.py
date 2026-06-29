@@ -2,8 +2,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # 强制同步CUDA，定位具体出错的行
-os.environ['TORCH_USE_CUDA_DSA'] = "1"     # 打印CUDA断言详细信息
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # 强制同步CUDA，定位具体出错的行
+# os.environ['TORCH_USE_CUDA_DSA'] = "1"     # 打印CUDA断言详细信息
 
 import warnings  # <--- 新增
 import logging   # <--- 新增

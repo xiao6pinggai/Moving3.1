@@ -11,10 +11,10 @@ class opts(object):
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         # basic experiment setting
-        self.parser.add_argument('--discribe', default='SGNet_tos_mfev14_R2M16') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
+        self.parser.add_argument('--discribe', default='SGNet_tos_mfev15_RnoneM32_woresidual') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
         self.parser.add_argument('--task', default='ctdet_points',
                                  help='task name.  ctdet_points |  ctdet ')
-        self.parser.add_argument('--exp_name', default='SGNet_tos_mfev14_R2M16', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
+        self.parser.add_argument('--exp_name', default='SGNet_tos_mfev15_RnoneM32_woresidual', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3
         self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3
@@ -114,7 +114,7 @@ class opts(object):
         self.parser.add_argument('--downsample_mode', type=str, default='maxpool', help='downsample mode "stride" or "maxpool"')
         self.parser.add_argument('--net1name', type=str, default='TOSConvNet', help='encoder use ATDC, supports TOSConvNet/DynamicTOSConvNet/TZSConvNet/TZSconvNet') # LightWeightedConv3D  # UNet3DWithNormalConv3D # TOSConvNet  # TZSConvNet # 修改11
         self.parser.add_argument('--use_tzsconv', type=str, default='tzsconv', help='temporal branch mode: "tzsconv" keeps the current branch, "tmf" uses temporal median filtering in TOSConvNet, "" disables it')
-        self.parser.add_argument('--MFE', type=str, default='cosv14')
+        self.parser.add_argument('--MFE', type=str, default='cosv15')
         #可视化 # cosv10 
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
         self.parser.add_argument('--vis_mode', type=str, default='mean', help='feature map aggregation mode: mean / max / channel index (e.g. 0 1 2)')

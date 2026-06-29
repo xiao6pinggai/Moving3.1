@@ -20,6 +20,7 @@ from lib.models.cos_dis_v11 import SparseSymmetricCosineAttention as SparseSymme
 from lib.models.cos_update_v12 import SparseSymmetricCosineAttention as SparseSymmetricCosineAttentionV12
 from lib.models.cos_update_v13 import FrameRestrictedSparseTrajectoryTransformer
 from lib.models.cos_update_v14 import ObjectCentricAssociationTokenFusion
+from lib.models.cos_update_v15 import SparseTrajectoryTokenModule
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
@@ -30,13 +31,15 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         mfe_cls = FrameRestrictedSparseTrajectoryTransformer
     elif mfe_name in ('cosv14', 'ocatf', 'object_token'):
         mfe_cls = ObjectCentricAssociationTokenFusion
+    elif mfe_name in ('cosv15', 'sttm', 'sparse_traj_token'):
+        mfe_cls = SparseTrajectoryTokenModule
     elif mfe_name == 'cosv11':
         mfe_cls = SparseSymmetricCosineAttentionV11
     elif mfe_name == 'cosv10':
         mfe_cls = SparseSymmetricCosineAttention
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
-    if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+    if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
         seq_len = getattr(opt, 'seqLen', None)
         if seq_len is not None:
             kwargs['num_frames'] = int(seq_len)
@@ -1254,8 +1257,8 @@ class UNetV2_3_T_nodown_v2_bf(nn.Module):
 
 
         # mfe # V2!!!
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
-            if self.MFE in ('cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
+            if self.MFE in ('cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
                 self.sptial2d1 = spconv.SparseSequential()
                 self.sptial2d2 = spconv.SparseSequential()
                 self.sptial2d3 = spconv.SparseSequential()
@@ -1390,7 +1393,7 @@ class UNetV2_3_T_nodown_v2_bf(nn.Module):
 
         # w/o shortcut process
         # x_conv3 = self.se3(x_conv3)
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
             if self.MFE == 'cosv10':
                 x_conv3 = self.shortcut3fusion(x_conv3)
@@ -1398,7 +1401,7 @@ class UNetV2_3_T_nodown_v2_bf(nn.Module):
         # [1600, 1408, 41] <- [800, 704, 21]
         # w/o shortcut process
         # x_conv2 = self.se2(x_conv2)
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
             if self.MFE == 'cosv10':
                 x_conv2 = self.shortcut2fusion(x_conv2)
@@ -1406,7 +1409,7 @@ class UNetV2_3_T_nodown_v2_bf(nn.Module):
         # [1600, 1408, 41] <- [1600, 1408, 41]
         # w/o shortcut process
         # x_conv1 = self.se1(x_conv1)
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
             if self.MFE == 'cosv10':
                 x_conv1 = self.shortcut1fusion(x_conv1)
@@ -1506,7 +1509,7 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
         # 原始 MFE 只控制 x_conv1 / x_conv2 / x_conv3 三条 skip。
         # ------------------------------------------------------------------
 
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             self.sptial2d1 = block(
                 16, 16, (1, 3, 3),
                 norm_fn=norm_fn,
@@ -1755,7 +1758,7 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
             self.inv_conv4,
         )
 
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
             # x_conv3 = self.shortcut3fusion(x_conv3)
 
@@ -1767,7 +1770,7 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
             self.inv_conv3,
         )
 
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
             # x_conv2 = self.shortcut2fusion(x_conv2)
 
@@ -1779,7 +1782,7 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
             self.inv_conv2,
         )
 
-        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
             # x_conv1 = self.shortcut1fusion(x_conv1)
 
@@ -1898,7 +1901,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # 原始 MFE 只控制 x_conv1 / x_conv2 / x_conv3 三条 skip。
         # ------------------------------------------------------------------
 
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             self.sptial2d1 = block(
                 16, 16, (1, 3, 3),
                 norm_fn=norm_fn,
@@ -2112,7 +2115,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # Decoder
         # x_conv3 is the deepest skip and x_bottle is the bottom branch.
         # ------------------------------------------------------------------
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
             # x_conv3 = self.shortcut3fusion(x_conv3)
 
@@ -2124,7 +2127,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             self.inv_conv3,
         )
 
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
             # x_conv2 = self.shortcut2fusion(x_conv2)
 
@@ -2136,7 +2139,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             self.inv_conv2,
         )
 
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
+        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
             x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
             # x_conv1 = self.shortcut1fusion(x_conv1)
 
