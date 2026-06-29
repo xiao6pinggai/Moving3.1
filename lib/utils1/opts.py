@@ -117,10 +117,11 @@ class opts(object):
         self.parser.add_argument('--MFE', type=str, default="cosv16")
         self.parser.add_argument('--MFE_skip', type=str, default='[0,0,1]', help='MFE skip switches for [conv1, conv2, conv3], e.g. [1,0,1]')
         self.parser.add_argument('--tmc_topk', type=str, default='[7,5,3]', help='cosv16 top-k per [conv1, conv2, conv3]; single value is broadcast')
+        self.parser.add_argument('--tmc_window_size', type=str, default='[51,25,11]', help='cosv16 window size per [conv1, conv2, conv3]; single value is broadcast')
         self.parser.add_argument('--tmc_hidden_ratio', type=float, default=0.5, help='cosv16 FFN hidden channel ratio')
         self.parser.add_argument('--tmc_pos_hidden', type=int, default=16, help='cosv16 position MLP hidden channels')
         self.parser.add_argument('--tmc_pos_scale', type=float, default=16.0, help='cosv16 coordinate normalization scale')
-        self.parser.add_argument('--tmc_chunk_size', type=int, default=2048, help='cosv16 cdist chunk size for full-frame top-k')
+        self.parser.add_argument('--tmc_chunk_size', type=int, default=0, help='cosv16 query chunk size; <=0 uses adaptive large-block chunking')
         #可视化 # cosv10 
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
         self.parser.add_argument('--vis_mode', type=str, default='mean', help='feature map aggregation mode: mean / max / channel index (e.g. 0 1 2)')

@@ -6,9 +6,9 @@ class TripletMotionConsistencySparseConv(nn.Module):
     """Triplet motion consistency update for sparse spatio-temporal points.
 
     The module keeps sparse coordinates unchanged and updates only point
-    features. Neighbor search is full-frame top-k within the same batch and
-    adjacent temporal frame. Points without both previous and next neighbors
-    receive an exact identity output.
+    features. Neighbor search is window-restricted top-k within the same batch
+    and adjacent temporal frame. Points without both previous and next
+    neighbors receive an exact identity output.
     """
 
     def __init__(
@@ -19,6 +19,7 @@ class TripletMotionConsistencySparseConv(nn.Module):
         temporal_dilation=1,
         conv=None,
         topk=3,
+        window_size=11,
         hidden_ratio=0.5,
         pos_hidden=16,
         pos_scale=16.0,
@@ -32,8 +33,11 @@ class TripletMotionConsistencySparseConv(nn.Module):
         self.alpha = alpha
         self.temporal_dilation = int(temporal_dilation)
         self.topk = max(1, int(topk))
+        self.window_size = max(1, int(window_size))
+        self.window_radius = self.window_size // 2
         self.pos_scale = float(pos_scale)
-        self.chunk_size = max(1, int(chunk_size))
+        self.chunk_size = int(chunk_size)
+        self.auto_pair_limit = 16 * 1024 * 1024
         self.valid_norm = bool(valid_norm)
         self.conv = conv if conv is not None else nn.Identity()
 
@@ -80,14 +84,28 @@ class TripletMotionConsistencySparseConv(nn.Module):
         k_eff = min(self.topk, int(cand_idx.numel()))
         query_xy = spatial[query_idx].float()
         cand_xy = spatial[cand_idx].float()
+        if self.chunk_size > 0:
+            step = self.chunk_size
+        else:
+            step = max(1, self.auto_pair_limit // max(1, int(cand_idx.numel())))
+            step = min(step, int(query_idx.numel()))
+        radius = float(self.window_radius)
+        inf = torch.tensor(float("inf"), device=query_xy.device, dtype=query_xy.dtype)
+        cand_y = cand_xy[:, 0].unsqueeze(0)
+        cand_x = cand_xy[:, 1].unsqueeze(0)
 
-        for start in range(0, query_idx.numel(), self.chunk_size):
-            end = min(start + self.chunk_size, query_idx.numel())
-            dist = torch.cdist(query_xy[start:end], cand_xy, p=2)
-            _, top_pos = torch.topk(dist, k=k_eff, dim=1, largest=False)
+        for start in range(0, query_idx.numel(), step):
+            end = min(start + step, query_idx.numel())
+            q_xy = query_xy[start:end]
+            dy = q_xy[:, 0].unsqueeze(1) - cand_y
+            dx = q_xy[:, 1].unsqueeze(1) - cand_x
+            in_window = (dy.abs() <= radius) & (dx.abs() <= radius)
+            dist2 = dy.square() + dx.square()
+            dist2 = dist2.masked_fill(~in_window, inf)
+            top_dist2, top_pos = torch.topk(dist2, k=k_eff, dim=1, largest=False)
             rows = query_idx[start:end]
             out_idx[rows, :k_eff] = cand_idx[top_pos]
-            out_mask[rows, :k_eff] = True
+            out_mask[rows, :k_eff] = torch.isfinite(top_dist2)
 
     def _find_triplet_neighbors(self, indices):
         n_points = indices.shape[0]
