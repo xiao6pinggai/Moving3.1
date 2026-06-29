@@ -21,10 +21,71 @@ from lib.models.cos_update_v12 import SparseSymmetricCosineAttention as SparseSy
 from lib.models.cos_update_v13 import FrameRestrictedSparseTrajectoryTransformer
 from lib.models.cos_update_v14 import ObjectCentricAssociationTokenFusion
 from lib.models.cos_update_v15 import SparseTrajectoryTokenModule
+from lib.models.cos_update_v16 import TripletMotionConsistencySparseConv
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
+MFE_MODULE_NAMES = (
+    'cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt',
+    'cosv14', 'ocatf', 'object_token',
+    'cosv15', 'sttm', 'sparse_traj_token',
+    'cosv16', 'tmc', 'tmc_sconv',
+)
+
+
+def parse_triplet_values(value, cast, name):
+    if value is None:
+        return (cast(3), cast(3), cast(3))
+    if isinstance(value, str):
+        text = value.strip().strip('[]()')
+        if ',' in text:
+            tokens = [token.strip() for token in text.split(',') if token.strip()]
+        else:
+            tokens = text.split()
+            if len(tokens) == 1:
+                tokens = tokens * 3
+    else:
+        tokens = list(value) if isinstance(value, (tuple, list)) else [value] * 3
+    if len(tokens) == 1:
+        tokens = tokens * 3
+    if len(tokens) != 3:
+        raise ValueError(f'{name} should contain 1 or 3 values for conv1/2/3, got {value}')
+    return tuple(cast(token) for token in tokens)
+
+
+def parse_mfe_skip(value):
+    if value is None:
+        return (True, True, True)
+    if isinstance(value, str):
+        text = value.strip().strip('[]()')
+        if ',' in text:
+            tokens = [token.strip() for token in text.split(',') if token.strip()]
+        else:
+            tokens = text.split()
+            if len(tokens) == 1 and len(tokens[0]) == 3 and all(ch in '01' for ch in tokens[0]):
+                tokens = list(tokens[0])
+    else:
+        tokens = list(value)
+    if len(tokens) != 3:
+        raise ValueError(f'MFE_skip should contain 3 bool values for conv1/2/3, got {value}')
+
+    def to_bool(token):
+        if isinstance(token, bool):
+            return token
+        if isinstance(token, (int, float)):
+            return bool(token)
+        token = str(token).strip().lower()
+        if token in ('1', 'true', 't', 'yes', 'y'):
+            return True
+        if token in ('0', 'false', 'f', 'no', 'n'):
+            return False
+        raise ValueError(f'Cannot parse MFE_skip value: {token}')
+
+    return tuple(to_bool(token) for token in tokens)
+
+
 def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
+    tmc_level = kwargs.pop('tmc_level', None)
     if mfe_name == 'cosv12':
         mfe_cls = SparseSymmetricCosineAttentionV12
     elif mfe_name in ('cosv13', 'frstt'):
@@ -37,12 +98,22 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         mfe_cls = SparseSymmetricCosineAttentionV11
     elif mfe_name == 'cosv10':
         mfe_cls = SparseSymmetricCosineAttention
+    elif mfe_name in ('cosv16', 'tmc', 'tmc_sconv'):
+        mfe_cls = TripletMotionConsistencySparseConv
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
     if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
         seq_len = getattr(opt, 'seqLen', None)
         if seq_len is not None:
             kwargs['num_frames'] = int(seq_len)
+    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv'):
+        topk_values = parse_triplet_values(getattr(opt, 'tmc_topk', 3), int, 'tmc_topk')
+        topk = topk_values[int(tmc_level)] if tmc_level is not None else topk_values[0]
+        kwargs.setdefault('topk', int(topk))
+        kwargs.setdefault('hidden_ratio', float(getattr(opt, 'tmc_hidden_ratio', 0.5)))
+        kwargs.setdefault('pos_hidden', int(getattr(opt, 'tmc_pos_hidden', 16)))
+        kwargs.setdefault('pos_scale', float(getattr(opt, 'tmc_pos_scale', 16.0)))
+        kwargs.setdefault('chunk_size', int(getattr(opt, 'tmc_chunk_size', 1024)))
     return mfe_cls(*args, **kwargs)
 
 class SparseBasicBlock(spconv.SparseModule):
@@ -1820,6 +1891,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         except:
             self.MFE = None
             print("Warning: MFE is not specified in opt, set to None.")
+        self.mfe_skip = parse_mfe_skip(getattr(self.opt, 'MFE_skip', (True, True, True)))
         self.sparse_shape = grid_size[::-1] + [1, 0, 0]
         self.voxel_size = voxel_size
         self.point_cloud_range = point_cloud_range
@@ -1901,7 +1973,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # 原始 MFE 只控制 x_conv1 / x_conv2 / x_conv3 三条 skip。
         # ------------------------------------------------------------------
 
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
+        if self.MFE in MFE_MODULE_NAMES:
             self.sptial2d1 = block(
                 16, 16, (1, 3, 3),
                 norm_fn=norm_fn,
@@ -1926,6 +1998,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
 
             self.shortcut1 = build_mfe_module(self.MFE, opt=self.opt,
+                tmc_level=0,
                 in_channels=16,
                 kernel_size=9,
                 use_qkv=False,
@@ -1936,6 +2009,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
                 conv=self.sptial2d1,
             )
             self.shortcut2 = build_mfe_module(self.MFE, opt=self.opt,
+                tmc_level=1,
                 in_channels=32,
                 kernel_size=7,
                 use_qkv=False,
@@ -1946,6 +2020,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
                 conv=self.sptial2d2,
             )
             self.shortcut3 = build_mfe_module(self.MFE, opt=self.opt,
+                tmc_level=2,
                 in_channels=64,
                 kernel_size=5,
                 use_qkv=False,
@@ -2115,7 +2190,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # Decoder
         # x_conv3 is the deepest skip and x_bottle is the bottom branch.
         # ------------------------------------------------------------------
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
+        if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[2]:
             x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
             # x_conv3 = self.shortcut3fusion(x_conv3)
 
@@ -2127,7 +2202,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             self.inv_conv3,
         )
 
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
+        if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[1]:
             x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
             # x_conv2 = self.shortcut2fusion(x_conv2)
 
@@ -2139,7 +2214,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             self.inv_conv2,
         )
 
-        if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
+        if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[0]:
             x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
             # x_conv1 = self.shortcut1fusion(x_conv1)
 

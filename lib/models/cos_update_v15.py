@@ -13,15 +13,14 @@ if _cur not in sys.path:
 
 
 class SparseTrajectoryTokenModule(nn.Module):
-    """v15 sparse trajectory token feature enhancement module.
+    """v15 稀疏轨迹 token 特征增强模块。
 
-    The module keeps sparse topology unchanged:
-    x.features [N, C] -> enhanced_features [N, C].
+    模块保持稀疏拓扑不变：
+    x.features [N, C] -> enhanced_features [N, C]。
 
-    Each cube is one 256 x 256 spatial window over all frames. Inside every
-    cube, v15 runs local sparse spatiotemporal attention, foreground trajectory
-    token read/fusion, global-pooled background token competition, and a
-    no-chunk point write-back.
+    每个 cube 表示跨越全部时间帧的一个 256 x 256 空间窗口。v15 在每个
+    cube 内部依次执行：局部稀疏时空注意力、前景轨迹 token 读取与融合、
+    全局池化背景 token 竞争，以及整块点集的写回更新。
     """
 
     def __init__(
@@ -45,6 +44,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         write_chunk_size=None,
         **kwargs,
     ):
+        """初始化 v15 所需的轨迹 token、位置编码和读写注意力子模块。"""
         super().__init__()
         if in_channels % num_heads != 0:
             raise ValueError(
@@ -59,11 +59,10 @@ class SparseTrajectoryTokenModule(nn.Module):
         self.num_traj = num_traj
         self.window_size = window_size
         self.alpha = alpha
-        self.local_temporal_radius = local_temporal_radius
-        self.local_spatial_radius = local_spatial_radius
+        self.local_temporal_radius = temporal_dilation
+        self.local_spatial_radius = kernel_size // 2
 
-        # Compatibility-only arguments. v15 intentionally does not use the
-        # old large kernel_size values passed by earlier MFE builders.
+        # 兼容旧版 MFE 构建器保留下来的参数，v15 只复用其中一部分配置含义。
         self.conv = conv
         self.indice_key = indice_key
         self.kernel_size = kernel_size
@@ -74,14 +73,17 @@ class SparseTrajectoryTokenModule(nn.Module):
         self.temporal_dilation = temporal_dilation
         self.write_chunk_size = write_chunk_size
 
+        # 将 (t, y, x) 编码成一维 key，便于快速检索局部邻域点。
         self.scale_y = 4096
         self.scale_t = 4096 * 4096
         self._build_local_offsets()
 
+        # 可学习的前景轨迹 token、前景时间编码、背景时间编码。
         self.traj_embed = nn.Parameter(torch.empty(num_traj, in_channels))
         self.time_embed = nn.Parameter(torch.empty(num_frames, in_channels))
         self.bg_time_embed = nn.Parameter(torch.empty(num_frames, in_channels))
 
+        # 点特征投影与归一化位置编码，用于构造初始点 token。
         self.feat_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.pos_mlp = nn.Sequential(
             nn.Linear(3, in_channels),
@@ -89,6 +91,7 @@ class SparseTrajectoryTokenModule(nn.Module):
             nn.Linear(in_channels, in_channels),
         )
 
+        # 局部稀疏注意力的 Q/K/V 与相对位置偏置网络。
         self.local_q_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.local_k_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.local_v_proj = nn.Linear(in_channels, in_channels, bias=False)
@@ -99,11 +102,13 @@ class SparseTrajectoryTokenModule(nn.Module):
             nn.Linear(local_hidden, 1),
         )
 
+        # 轨迹 token 从点 token 读取信息时所需的条件投影与 Q/K/V。
         self.global_proj = nn.Linear(in_channels, in_channels)
         self.read_q_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.read_k_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.read_v_proj = nn.Linear(in_channels, in_channels, bias=False)
 
+        # 沿时间维融合每条轨迹在不同帧上的响应。
         self.temporal_fusion = nn.TransformerEncoderLayer(
             d_model=in_channels,
             nhead=num_heads,
@@ -111,16 +116,19 @@ class SparseTrajectoryTokenModule(nn.Module):
             batch_first=True,
         )
 
+        # 背景 token 由 cube 全局均值生成，再与时间编码结合。
         self.bg_mlp = nn.Sequential(
             nn.Linear(in_channels, in_channels),
             nn.GELU(),
             nn.Linear(in_channels, in_channels),
         )
 
+        # 将前景/背景 token 重新写回点特征时使用的 Q/K/V。
         self.write_q_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.write_k_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.write_v_proj = nn.Linear(in_channels, in_channels, bias=False)
 
+        # 将原始残差与聚合上下文拼接后映射为最终增量。
         self.out_mlp = nn.Sequential(
             nn.Linear(2 * in_channels, in_channels),
             nn.GELU(),
@@ -130,6 +138,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         self.reset_parameters()
 
     def _build_local_offsets(self):
+        """构建局部时空邻域偏移表，供稀疏注意力查询邻点。"""
         rt = int(self.local_temporal_radius)
         rs = int(self.local_spatial_radius)
 
@@ -151,6 +160,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         self.register_buffer("local_offset_pos", offset_pos)
 
     def reset_parameters(self):
+        """初始化可学习参数，并让部分投影在初始阶段接近恒等映射。"""
         nn.init.trunc_normal_(self.traj_embed, std=0.02)
         nn.init.trunc_normal_(self.time_embed, std=0.02)
         nn.init.trunc_normal_(self.bg_time_embed, std=0.02)
@@ -166,6 +176,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         nn.init.zeros_(self.out_mlp[2].bias)
 
     def _cube_keys(self, indices):
+        """根据 batch 和窗口坐标生成 cube key，用于把点划分到不同空间块。"""
         b = indices[:, 0].long()
         y = indices[:, 2].long()
         x_coord = indices[:, 3].long()
@@ -174,6 +185,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         return b * 10_000_000_000 + wy * 100_000 + wx
 
     def _position_encoding(self, indices):
+        """将点的时间和窗口内相对位置归一化为 3 维坐标编码。"""
         dtype = torch.float32
         t = indices[:, 1].to(dtype).clamp(0, self.num_frames - 1)
         y = indices[:, 2].long()
@@ -190,6 +202,7 @@ class SparseTrajectoryTokenModule(nn.Module):
 
     @staticmethod
     def _edge_softmax(logits, row_idx, row_count):
+        """对稀疏边集合按源点分组做 softmax，得到归一化注意力权重。"""
         max_per_row = logits.new_full((row_count,), -float("inf"))
         if hasattr(max_per_row, "scatter_reduce_"):
             max_per_row.scatter_reduce_(
@@ -211,6 +224,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         return weights / denom[row_idx].clamp_min(1e-6)
 
     def _local_sparse_attention(self, point_tokens, indices):
+        """在局部时空邻域内执行稀疏注意力，增强点 token 的局部上下文。"""
         n_points, channels = point_tokens.shape
         if n_points == 0:
             return point_tokens
@@ -257,6 +271,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         return point_tokens + context
 
     def _temporal_fuse(self, traj_tokens, valid_frames):
+        """沿时间维融合轨迹 token，只在存在点的帧上保留有效响应。"""
         m_count = traj_tokens.shape[0]
         if not bool(valid_frames.any()):
             return traj_tokens
@@ -269,6 +284,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         return fused * valid_frames[None, :, None].to(fused.dtype)
 
     def forward_cube(self, residual_w, features_w, indices_w):
+        """处理单个 cube 内的点，完成轨迹读写并输出增强后的点特征。"""
         n_points, channels = features_w.shape
         device = features_w.device
         dtype = features_w.dtype
@@ -276,10 +292,12 @@ class SparseTrajectoryTokenModule(nn.Module):
         l_count = self.num_frames
         scale = math.sqrt(channels)
 
+        # 1) 点特征叠加位置编码，并先做一次局部稀疏时空增强。
         pos = self._position_encoding(indices_w).to(device=device, dtype=dtype)
         point_tokens = self.feat_proj(features_w) + self.pos_mlp(pos)
         e = self._local_sparse_attention(point_tokens, indices_w)
 
+        # 2) 依据 cube 全局语义生成当前 cube 的前景轨迹查询 token。
         cube_cond = self.global_proj(e.mean(dim=0, keepdim=True))
         q_traj = (
             self.traj_embed[:, None, :]
@@ -292,6 +310,7 @@ class SparseTrajectoryTokenModule(nn.Module):
         k_all = self.read_k_proj(e)
         v_all = self.read_v_proj(e)
 
+        # 3) 每一帧内让多条轨迹 token 从该帧点集中读取前景响应。
         traj_tokens = e.new_zeros((m_count, l_count, channels))
         valid_frames = torch.zeros(l_count, device=device, dtype=torch.bool)
 
@@ -305,8 +324,10 @@ class SparseTrajectoryTokenModule(nn.Module):
             traj_tokens[:, frame_id, :] = attn @ v_all[frame_mask]
             valid_frames[frame_id] = True
 
+        # 4) 对轨迹 token 做跨帧融合，补充时间一致性。
         traj_hat = self._temporal_fuse(traj_tokens, valid_frames)
 
+        # 5) 构造背景 token，并与前景轨迹 token 一起准备写回点特征。
         bg_base = self.bg_mlp(e.mean(dim=0, keepdim=True))
         bg_tokens = bg_base + self.bg_time_embed.to(device=device, dtype=dtype)
 
@@ -315,11 +336,12 @@ class SparseTrajectoryTokenModule(nn.Module):
         k_bg = self.write_k_proj(bg_tokens)
         q_points = self.write_q_proj(e)
 
-        # No chunk write-back by design: build [Nw, M, C] for the whole cube.
+        # 整个 cube 一次性写回，不再分 chunk 处理。
         k_fg_point = k_fg[:, t_local, :].permute(1, 0, 2)
         v_fg_point = v_fg[:, t_local, :].permute(1, 0, 2)
         k_bg_point = k_bg[t_local]
 
+        # 6) 每个点与背景 token、多个前景轨迹 token 竞争注意力权重。
         score_bg = (q_points * k_bg_point).sum(dim=1, keepdim=True) / scale
         score_fg = (q_points[:, None, :] * k_fg_point).sum(dim=-1) / scale
         score_all = torch.cat([score_bg, score_fg], dim=1)
@@ -329,11 +351,13 @@ class SparseTrajectoryTokenModule(nn.Module):
         context = (fg_weight[..., None] * v_fg_point).sum(dim=1)
         score_out = fg_weight.sum(dim=1, keepdim=True)
 
+        # 7) 将前景上下文写回残差特征，输出当前 cube 的增强结果。
         delta = self.out_mlp(torch.cat([residual_w, context], dim=1))
         out = residual_w + self.alpha * delta
         return out, score_out
 
     def forward(self, x):
+        """按 cube 分组遍历稀疏点云，对每个空间块独立执行前景轨迹增强。"""
         residual = x.features
         features = x.features
         indices = x.indices
@@ -344,10 +368,12 @@ class SparseTrajectoryTokenModule(nn.Module):
         if n_points == 0:
             return out, score
 
+        # 1) 先按空间窗口生成 cube key，相同 key 的点进入同一个 cube。
         cube_keys = self._cube_keys(indices)
         sorted_keys, sort_idx = torch.sort(cube_keys)
         counts = torch.unique_consecutive(sorted_keys, return_counts=True)[1]
 
+        # 2) 逐个 cube 调用 forward_cube，最后再写回原始点顺序。
         start = 0
         for count in counts.tolist():
             end = start + count
