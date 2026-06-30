@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 
@@ -11,9 +10,12 @@ class TripletMotionConsistencySparseConv(nn.Module):
     2. 去掉 GPU -> CPU 的 .item() / .cpu() / .tolist() 同步。
     3. 使用窗口 offset + hash key + searchsorted 做 CUDA 并行查找。
     4. 只对具有 previous-next 有效 triplet 的点计算三元特征与 FFN。
-    5. FFN 放在 “三元特征 * 位置门控” 之后。
-    6. BatchNorm1d 改为 LayerNorm。
-    7. 去掉 self.alpha 对输出的作用。
+    5. prev / cur / next 特征先各自 projection。
+    6. prev / next 分支使用共享相对位置 MLP，分别加入 Δ- / Δ+ embedding。
+    7. cat 得到 triplet_feat，由 FFN 完成 3C -> C 降维。
+    8. FFN 后乘 scalar pos_gate。
+    9. BatchNorm1d 改为 LayerNorm。
+    10. 去掉 self.alpha 对输出的作用。
     """
 
     def __init__(
@@ -41,26 +43,36 @@ class TripletMotionConsistencySparseConv(nn.Module):
         self.alpha = alpha
 
         self.temporal_dilation = int(temporal_dilation)
-        self.topk = max(1, int(topk))
-        self.window_size = max(1, int(window_size))
+        self.topk = int(topk)
+        self.window_size = int(window_size)
         self.window_radius = self.window_size // 2
         self.pos_scale = float(pos_scale)
         self.valid_norm = bool(valid_norm)
         self.conv = conv if conv is not None else nn.Identity()
 
-        hidden_channels = max(4, int(round(in_channels * float(hidden_ratio)))) # 可以增加参数量
-        pos_hidden = max(4, int(pos_hidden))
+        hidden_channels = int(round(in_channels * float(hidden_ratio)))
 
         self.prev_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.cur_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.next_proj = nn.Linear(in_channels, in_channels, bias=False)
 
-        self.pos_mlp = nn.Sequential( # 可以增加参数量
+        # scalar gate：仍然使用完整 triplet 运动输入 [Δ-, Δ+, acc]，维度为 6。
+        self.pos_mlp = nn.Sequential(
             nn.Linear(6, pos_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(pos_hidden, 1),
         )
 
+        # prev / next 分支共享同一个相对位置 embedding MLP：
+        # prev 分支输入 Δ- = current - previous。
+        # next 分支输入 Δ+ = next - current。
+        self.rel_pos_mlp = nn.Sequential(
+            nn.Linear(2, pos_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(pos_hidden, in_channels),
+        )
+
+        # prev / cur / next 相加后仍为 C 维，由 FFN 更新。
         self.ffn = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
             nn.ReLU(inplace=True),
@@ -74,6 +86,10 @@ class TripletMotionConsistencySparseConv(nn.Module):
         # 初始位置门控保持中性：2 * sigmoid(0) = 1。
         nn.init.zeros_(self.pos_mlp[-1].weight)
         nn.init.zeros_(self.pos_mlp[-1].bias)
+
+        # 初始共享相对位置 embedding 为 0，避免刚加入时破坏原始特征分支。
+        nn.init.zeros_(self.rel_pos_mlp[-1].weight)
+        nn.init.zeros_(self.rel_pos_mlp[-1].bias)
 
         # 预先构造窗口内 offset，并按距离从近到远排序。
         # 后续只需要保留前 K 个有效 offset，即是真正窗口内 top-k。
@@ -237,20 +253,7 @@ class TripletMotionConsistencySparseConv(nn.Module):
 
         n_valid = valid_idx.shape[0]
 
-        # 3. 只投影参与有效更新的点及其邻居。
-        prev_feat = self.prev_proj(features[idx_prev_v.reshape(-1)]).view(n_valid, k, channels)
-        cur_feat = self.cur_proj(features[valid_idx]).view(n_valid, 1, 1, channels)
-        next_feat = self.next_proj(features[idx_next_v.reshape(-1)]).view(n_valid, k, channels)
-
-        # 4. 构造三元特征。
-        # z_{iuv} = Wp h_prev + Wc h_cur + Wn h_next
-        triplet_feat = (
-            prev_feat.unsqueeze(2)
-            + cur_feat
-            + next_feat.unsqueeze(1)
-        )
-
-        # 5. 构造基于运动一致性的 6 维位置编码。
+        # 3. 构造基于运动一致性的 6 维位置编码。
         # Δ- = current - previous
         # Δ+ = next - current
         # acc = Δ+ - Δ- = next - 2 * current + previous
@@ -264,28 +267,56 @@ class TripletMotionConsistencySparseConv(nn.Module):
         s_plus = (s_next - s_cur).expand(-1, k, -1, -1)
         accel = s_plus - s_minus
 
+        pos_scale = max(self.pos_scale, 1e-6)
+        s_minus_norm = s_minus / pos_scale
+        s_plus_norm = s_plus / pos_scale
+
         motion_input = torch.cat(
             [s_minus, s_plus, accel],
             dim=-1,
-        ) / max(self.pos_scale, 1e-6)
+        ) / pos_scale
 
-        # 6. 位置编码生成 scalar gate。
-        # 初始时 pos_gate ≈ 1，训练后根据运动一致性调制三元特征。
+        # 4. 位置编码生成 scalar gate。
+        # 初始时 pos_gate ≈ 1，训练后根据运动一致性调制 FFN 后的 triplet message。
         pos_score = self.pos_mlp(motion_input.reshape(-1, 6))
         pos_score = pos_score.view(n_valid, k, k, 1)
 
         pos_gate = 2.0 * torch.sigmoid(pos_score)
         pos_gate = pos_gate * mask_pair_v.unsqueeze(-1).to(pos_gate.dtype)
 
-        # 7. 按你的要求：FFN 放在 “三元特征 * 位置编码” 之后。
-        # 注意 FFN 有 bias，因此 FFN 后仍然乘一次 mask，保证无效 triplet 不产生贡献。
-        triplet_input = triplet_feat * pos_gate
+        # 5. prev / next 原始特征先加入相对位置 embedding，再做 point-wise projection。
+        prev_branch = features[idx_prev_v.reshape(-1)].view(n_valid, k, 1, channels)
+        prev_branch = prev_branch.expand(-1, -1, k, -1)
+        next_branch = features[idx_next_v.reshape(-1)].view(n_valid, 1, k, channels)
+        next_branch = next_branch.expand(-1, k, -1, -1)
 
-        triplet_msg = self.ffn(triplet_input.reshape(-1, channels))
+        prev_pos_emb = self.rel_pos_mlp(s_minus_norm.reshape(-1, 2))
+        prev_pos_emb = prev_pos_emb.view(n_valid, k, k, channels)
+
+        next_pos_emb = self.rel_pos_mlp(s_plus_norm.reshape(-1, 2))
+        next_pos_emb = next_pos_emb.view(n_valid, k, k, channels)
+
+        prev_branch = self.prev_proj((prev_branch + prev_pos_emb).reshape(-1, channels))
+        prev_branch = prev_branch.view(n_valid, k, k, channels)
+
+        cur_branch = self.cur_proj(features[valid_idx]).view(n_valid, 1, 1, channels)
+        cur_branch = cur_branch.expand(-1, k, k, -1)
+
+        next_branch = self.next_proj((next_branch + next_pos_emb).reshape(-1, channels))
+        next_branch = next_branch.view(n_valid, k, k, channels)
+
+        # 6. 保留 587 版 add 约束：三支 projection 后相加，再由 FFN 更新。
+        triplet_feat = prev_branch + cur_branch + next_branch
+
+        # 7. FFN 完成 C -> C 更新。
+        triplet_msg = self.ffn(triplet_feat.reshape(-1, channels))
         triplet_msg = triplet_msg.view(n_valid, k, k, channels)
-        triplet_msg = triplet_msg * mask_pair_v.unsqueeze(-1).to(triplet_msg.dtype)
 
-        # 8. 对 K × K 个 triplet message 聚合。
+        # 8. FFN 后乘 scalar pos_gate。
+        # pos_gate 已包含有效 triplet mask。
+        triplet_msg = triplet_msg * pos_gate.to(triplet_msg.dtype)
+
+        # 9. 对 K × K 个 triplet message 聚合。
         msg_sum = triplet_msg.sum(dim=2).sum(dim=1)
 
         if self.valid_norm:
@@ -296,18 +327,22 @@ class TripletMotionConsistencySparseConv(nn.Module):
 
         update_v = msg_sum / denom
 
-        # 9. 使用 LayerNorm 替代 BatchNorm。
+        # 12. 原有 norm 不变：LayerNorm + ReLU。
         update_v = self.act(self.norm(update_v))
 
-        # 10. 写回完整 N 个点的 update。
+        # 13. 写回完整 N 个点的 update。
         update = features.new_zeros(n_points, channels)
         update[valid_idx] = update_v
 
-        # 11. score 表示有效 triplet 的平均位置门控强度。
+        # 14. score 表示有效 triplet 的平均位置门控强度。
         score_v = pos_gate.sum(dim=2).sum(dim=1) / denom.to(pos_gate.dtype)
 
         score = features.new_zeros(n_points, 1)
         score[valid_idx] = score_v
 
-        # 12. 去掉 self.alpha 的作用，直接 residual update。
-        return input_features + update, score
+        # 15. 去掉 self.alpha 的作用，直接 residual update。
+        output = input_features.clone()
+        # masked 点保持 identity；
+        # valid_idx 中的点使用 0.5 * input + 0.5 * update。
+        output[valid_idx] = 0.5 * input_features[valid_idx] + 0.5 * update_v
+        return output, score
