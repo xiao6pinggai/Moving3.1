@@ -25,7 +25,7 @@ class TripletMotionConsistencySparseConv(nn.Module):
         conv=None,
         topk=3,
         window_size=11,
-        hidden_ratio=0.5,
+        hidden_ratio=4,
         pos_hidden=16,
         pos_scale=16.0,
         chunk_size=1024,
@@ -48,14 +48,14 @@ class TripletMotionConsistencySparseConv(nn.Module):
         self.valid_norm = bool(valid_norm)
         self.conv = conv if conv is not None else nn.Identity()
 
-        hidden_channels = max(4, int(round(in_channels * float(hidden_ratio))))
+        hidden_channels = max(4, int(round(in_channels * float(hidden_ratio)))) # 可以增加参数量
         pos_hidden = max(4, int(pos_hidden))
 
         self.prev_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.cur_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.next_proj = nn.Linear(in_channels, in_channels, bias=False)
 
-        self.pos_mlp = nn.Sequential(
+        self.pos_mlp = nn.Sequential( # 可以增加参数量
             nn.Linear(6, pos_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(pos_hidden, 1),

@@ -33,6 +33,19 @@ MFE_MODULE_NAMES = (
 )
 
 
+def parse_optional_module_name(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text == '':
+            return None
+        if text.lower() in ('none', 'null'):
+            return None
+        return text.lower()
+    return value
+
+
 def parse_triplet_values(value, cast, name):
     if value is None:
         return (cast(3), cast(3), cast(3))
@@ -134,6 +147,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         except:
             self.MFE = None
             print("Warning: MFE is not specified in opt, set to None.")
+        self.bottle_enhancement = parse_optional_module_name(getattr(self.opt, 'bottle_enhancement', None))
         self.mfe_skip = parse_mfe_skip(getattr(self.opt, 'MFE_skip', (True, True, True)))
         self.sparse_shape = grid_size[::-1] + [1, 0, 0]
         self.voxel_size = voxel_size
@@ -190,7 +204,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             block(64, 64, 3, norm_fn=norm_fn, padding=1, indice_key='subm3'),
         )
 
-        self.x_bottle = spconv.SparseSequential(
+        self.x_bottle_down = spconv.SparseSequential(
             block(
                 64, 128, 3,
                 norm_fn=norm_fn,
@@ -199,7 +213,35 @@ class UNetV2_3_T_nodown_v2(nn.Module):
                 indice_key='spconv_b',
                 conv_type='spconv',
             ),
-            block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'),
+        )
+
+        if self.bottle_enhancement == 'block':
+            self.x_bottle_enhancement = block(
+                128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'
+            )
+        elif self.bottle_enhancement in MFE_MODULE_NAMES:
+            self.x_bottle_enhancement = build_mfe_module(
+                self.bottle_enhancement,
+                opt=self.opt,
+                tmc_level=2,
+                in_channels=128,
+                kernel_size=3,
+                use_qkv=False,
+                use_maxpool=False,
+                alpha=0.5,
+                use_biqkv=False,
+                temporal_dilation=1,
+                conv=spconv.SparseSequential(),
+            )
+        elif self.bottle_enhancement is None:
+            self.x_bottle_enhancement = None
+        else:
+            raise ValueError(
+                f'Unknown bottle_enhancement: {self.bottle_enhancement}. '
+                f'Expected None, "block", or one of {MFE_MODULE_NAMES}.'
+            )
+
+        self.x_bottle_up = spconv.SparseSequential(
             block(
                 128, 64, 3,
                 stride=(1, 2, 2),
@@ -427,7 +469,12 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         x_conv2 = self.conv2(x_conv1)
         x_conv3 = self.conv3(x_conv2)
 
-        x_bottle = self.x_bottle(x_conv3)
+        x_bottle = self.x_bottle_down(x_conv3)
+        if self.bottle_enhancement == 'block':
+            x_bottle = self.x_bottle_enhancement(x_bottle)
+        elif self.bottle_enhancement in MFE_MODULE_NAMES:
+            x_bottle = replace_feature(x_bottle, self.x_bottle_enhancement(x_bottle)[0])
+        x_bottle = self.x_bottle_up(x_bottle)
 
         # ------------------------------------------------------------------
         # Decoder
