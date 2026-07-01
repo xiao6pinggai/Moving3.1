@@ -124,19 +124,18 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
     if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
-        seq_len = getattr(opt, 'seqLen', None)
-        if seq_len is not None:
-            kwargs['num_frames'] = int(seq_len)
+        kwargs['num_frames'] = int(opt.seqLen)
     if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv'):
-        topk_values = parse_triplet_values(getattr(opt, 'tmc_topk', 3), int, 'tmc_topk')
-        window_values = parse_triplet_values(getattr(opt, 'tmc_window_size', 11), int, 'tmc_window_size')
+        topk_values = parse_triplet_values(opt.tmc_topk, int, 'tmc_topk')
+        window_values = parse_triplet_values(opt.tmc_window_size, int, 'tmc_window_size')
         idx = int(tmc_level) if tmc_level is not None else 0
         kwargs.setdefault('topk', int(topk_values[idx]))
         kwargs.setdefault('window_size', int(window_values[idx]))
-        kwargs.setdefault('hidden_ratio', float(getattr(opt, 'tmc_hidden_ratio', 0.5)))
-        kwargs.setdefault('pos_hidden', int(getattr(opt, 'tmc_pos_hidden', 16)))
-        kwargs.setdefault('pos_scale', float(getattr(opt, 'tmc_pos_scale', 16.0)))
-        kwargs.setdefault('chunk_size', int(getattr(opt, 'tmc_chunk_size', 0)))
+        kwargs.setdefault('hidden_ratio', float(opt.tmc_hidden_ratio))
+        kwargs.setdefault('pos_hidden', int(opt.tmc_pos_hidden))
+        kwargs.setdefault('pos_scale', float(opt.tmc_pos_scale))
+        kwargs.setdefault('chunk_size', int(opt.tmc_chunk_size))
+        kwargs.setdefault('ffn_position', opt.tmc_ffn_position)
     return mfe_cls(*args, **kwargs)
   
 class UNetV2_3_T_nodown_v2(nn.Module):

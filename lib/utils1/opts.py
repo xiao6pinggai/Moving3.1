@@ -11,14 +11,14 @@ class opts(object):
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         # basic experiment setting
-        self.parser.add_argument('--discribe', default='v18_001_w7_k9_motionpairtopk_scalerposgate') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
+        self.parser.add_argument('--discribe', default='v18_cuda_001_w7_k9_motionpairtopk_woposgate') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
         self.parser.add_argument('--task', default='ctdet_points',
                                  help='task name.  ctdet_points |  ctdet ')
-        self.parser.add_argument('--exp_name', default='v18_001_w7_k9_motionpairtopk_scalerposgate', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
+        self.parser.add_argument('--exp_name', default='v18_cuda_001_w7_k9_motionpairtopk_woposgate', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3
         self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3
-        self.parser.add_argument('--load_model', default= 'weights/rs_car_new_multi/I2PSOD/v18_001_w7_k9_motionpairtopk_scalerposgate_supMode_0_seglen10_weights2026_07_01_02_29_06/model_best_dis_f1_best.pth',
+        self.parser.add_argument('--load_model', default= '',
                                  help='path to pretrained model')
         self.parser.add_argument('--resume', type=bool, default=True, help='resume an experiment.')
         self.parser.add_argument('--down_ratio', type=int, default=1, help='output stride. Currently only supports for 1.')
@@ -123,6 +123,7 @@ class opts(object):
         self.parser.add_argument('--tmc_pos_hidden', type=int, default=16, help='cosv18 position MLP hidden channels')
         self.parser.add_argument('--tmc_pos_scale', type=float, default=16.0, help='cosv18 coordinate normalization scale')
         self.parser.add_argument('--tmc_chunk_size', type=int, default=0, help='cosv18 query chunk size; <=0 uses adaptive large-block chunking')
+        self.parser.add_argument('--tmc_ffn_position', type=str, default='before_mean', choices=['before_mean', 'after_mean'], help='cosv18 FFN placement: before_mean keeps per-pair FFN; after_mean applies FFN after pair averaging')
         #可视化 # cosv10 
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
         self.parser.add_argument('--vis_mode', type=str, default='mean', help='feature map aggregation mode: mean / max / channel index (e.g. 0 1 2)')
