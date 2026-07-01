@@ -66,9 +66,10 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             raise ValueError("CUDA v18 currently requires tmc_topk > 0; use the Python baseline for topk<=0 all-pair mode")
         self.window_size = max(1, int(window_size))
         self.window_radius = self.window_size // 2
-        self.pos_scale = float(pos_scale)
+        # self.pos_scale = float(pos_scale)
+        self.pos_scale = window_size // 2
         self.valid_norm = bool(valid_norm)
-        self.use_pos_gate = False
+        self.use_pos_gate = True
         self.conv = conv if conv is not None else nn.Identity()
         self.use_cuda_kernel = bool(use_cuda_kernel)
         self.allow_python_fallback = bool(allow_python_fallback)

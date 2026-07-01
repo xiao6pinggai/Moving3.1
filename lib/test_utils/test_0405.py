@@ -9,6 +9,7 @@ from lib.utils_eval.evaluation_net1_point import eval_net1_points
 from lib.test_utils.show_imgs import *
 from lib.test_utils.process_img_dets import *
 from lib.utils1.save_img import save_net1_output
+from concurrent.futures import ThreadPoolExecutor
 import GPUtil
 import scipy.io as scio
 import gc
@@ -119,131 +120,143 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
                 # [MODIFIED] 初始化该视频序列的点云缓存字典
                 # 结构: { global_frame_id (int): np.array([[y, x], ...]) }
                 video_coords_cache = {}
+            patch_infos = []
             for pk in range(patch_num):
-                time_start = time.time()
-                if overlap_flag and pk==patch_num-1:
-                    patch_ims = img_list[imgs_number-patch_len:imgs_number]
-                    video_frame_id = imgs_number-patch_len+1
+                if overlap_flag and pk == patch_num - 1:
+                    patch_ims = img_list[imgs_number - patch_len:imgs_number]
+                    video_frame_id = imgs_number - patch_len + 1
                 else:
-                    video_frame_id = pk*patch_len+1
-                    patch_ims = img_list[pk*patch_len : (pk+1)*patch_len]
+                    video_frame_id = pk * patch_len + 1
+                    patch_ims = img_list[pk * patch_len:(pk + 1) * patch_len]
                 patch_ims_path = [os.path.join(data_folder_path, i) for i in patch_ims]
                 patch_xml_path = [
-                                    f.replace("img1", xmlname).rsplit('.', 1)[0] + ".xml" 
-                                    for f in patch_ims_path
-                                ] # rsplit('.', 1) 表示从右边开始，以 . 为分隔符，只切分 1 次。
-                
-                # time_start1 = time.time() # 合理的位置
-                time_start0 = time.time()
-                batch_dict, meta, patch_imgs, input_batch = preprocess(patch_ims_path, DataVal, patch_xml_path)
-                # patch_imgs: 未归一化的原始图像；input_batch: 归一化RGB图像和未归一化的灰度图(字典)
-                for k in input_batch:
-                    if k == 'batch_size':
-                        continue
-                    input_batch[k] = torch.from_numpy(input_batch[k]).to(opt.device)
-                time_start1 = time.time() # 放在这里不合理
-                output, dets = process(model, input_batch, return_time, opt, opt.K) # output==z
-                if False:
-                    # 累加当前批次的采样率
-                    total_sampling_rate += output['sampling_rate'].item()
-                    num_batches += 1
-                if False:
-                    os.makedirs(save_mat_folder+'vis', exist_ok=True)
-                    for ik in range(len(patch_ims)):
-                        imgpath = os.path.join(save_mat_folder+'vis', os.path.splitext(patch_ims[ik])[0] + '.png')
-                        save_net1_output(output['soft_mask'][0][0][ik], imgpath,mode='255')
-                # dets.shape=torch.Size([20, 128, 6]) # 表示20张图像，每张图像最多128个检测框，每个检测框6个值(x1,y1,x2,y2,score,class:0)
-                # output是模型的原始输出，包含热力图、wh、reg、mask_all、voxel_coords、lasso等信息
-                torch.cuda.synchronize()
-                time_start3 = time.time()
-                # 后处理
-                rets, dets_post = post_process(dets, meta, num_classes, max_per_image=max_per_image)
-                # 后处理实际上做了张量转成字典（内部为20个array，每个array包含128个array，每个array有一个6元素的列表）的变形
-                # 由于都采用了top128所以二者形状是相同的，只是dets_post是直接topK，而rets经过nms改变了score数值，因此排序发生了可一定变化
-                # 计算指标用NMS以后的
+                    f.replace("img1", xmlname).rsplit('.', 1)[0] + ".xml"
+                    for f in patch_ims_path
+                ]
+                patch_infos.append((patch_ims, patch_ims_path, patch_xml_path, video_frame_id))
 
-                time_end = time.time()
-                time_all.append(time_end - time_start1)
-                preprocess_time_all.append((time_start1 - time_start0))
-                if save_json:
-                    for im_id_i, ret in enumerate(rets):
-                        img_rel_path = os.path.relpath(
-                            patch_ims_path[im_id_i], test_upper_path).replace(os.sep, '/')
-                        if image_id_map is not None:
-                            im_id = image_id_map.get(img_rel_path)
-                            if im_id is None:
-                                im_id = image_id_map.get(os.path.splitext(img_rel_path)[0])
-                            if im_id is None:
-                                raise KeyError(
-                                    f'Cannot find COCO image_id for test image: {img_rel_path}')
-                        else:
-                            im_id = video_frame_id+im_id_i+his_img_num
-                        results[im_id] = ret
-                    # print(len(results))
-                    im_id += patch_len
-                # 假设 output['voxel_coords'] shape 为 [N, 4] -> (batch_idx, time_idx, y, x)
-                # 其中 batch_idx 在测试时通常为 0 (单Batch推理)
-                if test_net1 and 'voxel_coords' in output:
-                    coords_tensor = output['voxel_coords']
-                    
-                    if coords_tensor.shape[0] > 0:
-                        # 转为 numpy, (N, 4)
-                        coords_np = coords_tensor.detach().cpu().numpy()
+            with ThreadPoolExecutor(max_workers=1) as preprocess_pool:
+                next_future = preprocess_pool.submit(preprocess, patch_infos[0][1], DataVal, patch_infos[0][2])
+                for pk, (patch_ims, patch_ims_path, _, video_frame_id) in enumerate(patch_infos):
+                    time_start = time.time()
+                    time_start0 = time.time()
+                    batch_dict, meta, patch_imgs, input_batch = next_future.result()
+                    if pk + 1 < patch_num:
+                        next_future = preprocess_pool.submit(
+                            preprocess,
+                            patch_infos[pk + 1][1],
+                            DataVal,
+                            patch_infos[pk + 1][2]
+                        )
+                    else:
+                        next_future = None
+                    for k in input_batch:
+                        if k == 'batch_size':
+                            continue
+                        input_batch[k] = torch.from_numpy(input_batch[k]).to(opt.device)
+                    time_start1 = time.time()
+                    output, dets = process(model, input_batch, return_time, opt, opt.K) # output==z
+                    if False:
+                        # 累加当前批次的采样率
+                        total_sampling_rate += output['sampling_rate'].item()
+                        num_batches += 1
+                    if False:
+                        os.makedirs(save_mat_folder+'vis', exist_ok=True)
+                        for ik in range(len(patch_ims)):
+                            imgpath = os.path.join(save_mat_folder+'vis', os.path.splitext(patch_ims[ik])[0] + '.png')
+                            save_net1_output(output['soft_mask'][0][0][ik], imgpath,mode='255')
+                    # dets.shape=torch.Size([20, 128, 6]) # 表示20张图像，每张图像最多128个检测框，每个检测框6个值(x1,y1,x2,y2,score,class:0)
+                    # output是模型的原始输出，包含热力图、wh、reg、mask_all、voxel_coords、lasso等信息
+                    torch.cuda.synchronize()
+                    time_start3 = time.time()
+                    # 后处理
+                    rets, dets_post = post_process(dets, meta, num_classes, max_per_image=max_per_image)
+                    # 后处理实际上做了张量转成字典（内部为20个array，每个array包含128个array，每个array有一个6元素的列表）的变形
+                    # 由于都采用了top128所以二者形状是相同的，只是dets_post是直接topK，而rets经过nms改变了score数值，因此排序发生了可一定变化
+                    # 计算指标用NMS以后的
+
+                    time_end = time.time()
+                    time_all.append(time_end - time_start1)
+                    preprocess_time_all.append((time_start1 - time_start0))
+                    if save_json:
+                        for im_id_i, ret in enumerate(rets):
+                            img_rel_path = os.path.relpath(
+                                patch_ims_path[im_id_i], test_upper_path).replace(os.sep, '/')
+                            if image_id_map is not None:
+                                im_id = image_id_map.get(img_rel_path)
+                                if im_id is None:
+                                    im_id = image_id_map.get(os.path.splitext(img_rel_path)[0])
+                                if im_id is None:
+                                    raise KeyError(
+                                        f'Cannot find COCO image_id for test image: {img_rel_path}')
+                            else:
+                                im_id = video_frame_id+im_id_i+his_img_num
+                            results[im_id] = ret
+                        # print(len(results))
+                        im_id += patch_len
+                    # 假设 output['voxel_coords'] shape 为 [N, 4] -> (batch_idx, time_idx, y, x)
+                    # 其中 batch_idx 在测试时通常为 0 (单Batch推理)
+                    if test_net1 and 'voxel_coords' in output:
+                        coords_tensor = output['voxel_coords']
                         
-                        # 遍历当前 Patch 中的每一帧 (通常 time_idx 范围是 0 到 seqLen-1)
-                        # 获取当前 Patch 包含的局部时间步
-                        unique_time_indices = np.unique(coords_np[:, 1])
-                        
-                        for local_t in unique_time_indices:
-                            # 计算全局帧 ID
-                            # video_frame_id 是当前 Patch 第一帧的物理文件名序号 (如 1, 6, 11...)
-                            # local_t 是 Patch 内部的偏移量 (0, 1, 2, 3, 4)
-                            global_fid = int(video_frame_id + local_t)
+                        if coords_tensor.shape[0] > 0:
+                            # 转为 numpy, (N, 4)
+                            coords_np = coords_tensor.detach().cpu().numpy()
                             
-                            # 提取属于该帧的所有点 (y, x)
-                            # mask: 筛选当前 Batch (通常是0) 和当前 Time
-                            # 注意：如果 batch_size > 1，这里需要加上 batch_idx 的判断，但测试通常 batch=1
-                            mask = (coords_np[:, 1] == local_t)
+                            # 遍历当前 Patch 中的每一帧 (通常 time_idx 范围是 0 到 seqLen-1)
+                            # 获取当前 Patch 包含的局部时间步
+                            unique_time_indices = np.unique(coords_np[:, 1])
                             
-                            # 取 [y, x] 部分 (Indices 2 and 3)
-                            current_frame_points = coords_np[mask, 2:4].astype(np.int32)
-                        
-                            video_coords_cache[global_fid] = current_frame_points
+                            for local_t in unique_time_indices:
+                                # 计算全局帧 ID
+                                # video_frame_id 是当前 Patch 第一帧的物理文件名序号 (如 1, 6, 11...)
+                                # local_t 是 Patch 内部的偏移量 (0, 1, 2, 3, 4)
+                                global_fid = int(video_frame_id + local_t)
+                                
+                                # 提取属于该帧的所有点 (y, x)
+                                # mask: 筛选当前 Batch (通常是0) 和当前 Time
+                                # 注意：如果 batch_size > 1，这里需要加上 batch_idx 的判断，但测试通常 batch=1
+                                mask = (coords_np[:, 1] == local_t)
+                                
+                                # 取 [y, x] 部分 (Indices 2 and 3)
+                                current_frame_points = coords_np[mask, 2:4].astype(np.int32)
+                            
+                                video_coords_cache[global_fid] = current_frame_points
 
 
-                if pk % 50 == 0:
-                    print('&& Processing folder %d/%d, patch %d/%d' % (ii+1, len(data_folder_list), pk+1, patch_num),
-                          '&& time_used:', time_end - time_start, time_end - time_start1, time_start3 - time_start1,
-                          '&& patch_len: {} GPU used: {}/{}'.format(patch_len, gpu.memoryUsed, gpu.memoryTotal))
-                    # print('time_used:', time_end - time_start, time_end - time_start1, time_start3 - time_start1)
-                    # print('patch_len: {} GPU used: {}/{}'.format(patch_len, gpu.memoryUsed, gpu.memoryTotal))
-                ### view results
-                if save_mat:
-                    fig_save_name1 = os.path.join(save_mat_folder, '%03d_ori.png'%(pk+1))
-                    fig_save_name2 = os.path.join(save_mat_folder, '%03d_det.png' % (pk + 1))
-                    # view_cloud(output['voxel_coords'], save_flag=1, fig_save_name = fig_save_name1)
-                    # view_dets(dets, conf_th=0.25,save_flag=1, fig_save_name = fig_save_name2)
-                    # plt.close('all') # lhg
-                if(show_flag):
-                    hm1 = output['hm'].squeeze(0).squeeze(0).cpu().detach().numpy()
-                    for det_i in range(len(dets_post)):
-                        img = patch_imgs[:,:,:,det_i]
-                        frame, _ = cv2_demo(img.astype(np.uint8), dets_post[det_i][1])
+                    if pk % 50 == 0:
+                        print('&& Processing folder %d/%d, patch %d/%d' % (ii+1, len(data_folder_list), pk+1, patch_num),
+                              '&& time_used:', time_end - time_start, time_end - time_start1, time_start3 - time_start1,
+                              '&& patch_len: {} GPU used: {}/{}'.format(patch_len, gpu.memoryUsed, gpu.memoryTotal))
+                        # print('time_used:', time_end - time_start, time_end - time_start1, time_start3 - time_start1)
+                        # print('patch_len: {} GPU used: {}/{}'.format(patch_len, gpu.memoryUsed, gpu.memoryTotal))
+                    ### view results
+                    if save_mat:
+                        fig_save_name1 = os.path.join(save_mat_folder, '%03d_ori.png'%(pk+1))
+                        fig_save_name2 = os.path.join(save_mat_folder, '%03d_det.png' % (pk + 1))
+                        # view_cloud(output['voxel_coords'], save_flag=1, fig_save_name = fig_save_name1)
+                        # view_dets(dets, conf_th=0.25,save_flag=1, fig_save_name = fig_save_name2)
+                        # plt.close('all') # lhg
+                    if(show_flag):
+                        hm1 = output['hm'].squeeze(0).squeeze(0).cpu().detach().numpy()
+                        for det_i in range(len(dets_post)):
+                            img = patch_imgs[:,:,:,det_i]
+                            frame, _ = cv2_demo(img.astype(np.uint8), dets_post[det_i][1])
 
-                        cv2.imshow('frame',frame)
-                        cv2.waitKey(5)
-                        hm2 = hm1[det_i]
-                        cv2.imshow('hm', hm2)
-                        cv2.waitKey(5)
+                            cv2.imshow('frame',frame)
+                            cv2.waitKey(5)
+                            hm2 = hm1[det_i]
+                            cv2.imshow('hm', hm2)
+                            cv2.waitKey(5)
 
-                if save_mat:
-                    for ik in range(len(patch_ims)):
-                        # mat_save_name = os.path.join(save_mat_folder, patch_ims[ik].replace('.jpg', '.mat'))
-                        mat_save_name = os.path.join(save_mat_folder, os.path.splitext(patch_ims[ik])[0] + '.mat')
-                        ret = rets[ik] # {1~2255:(128,5)}
-                        A = np.array(ret[1])# [1]是key
-                        scio.savemat(mat_save_name, {'A':A})
-                        del A, ret
+                    if save_mat:
+                        for ik in range(len(patch_ims)):
+                            # mat_save_name = os.path.join(save_mat_folder, patch_ims[ik].replace('.jpg', '.mat'))
+                            mat_save_name = os.path.join(save_mat_folder, os.path.splitext(patch_ims[ik])[0] + '.mat')
+                            ret = rets[ik] # {1~2255:(128,5)}
+                            A = np.array(ret[1])# [1]是key
+                            scio.savemat(mat_save_name, {'A':A})
+                            del A, ret
             # [MODIFIED] 单个视频所有 Patch 处理完后，统一保存坐标 txt
             if test_net1 and len(video_coords_cache) > 0:
                 save_txt_path_upper = os.path.join(opt.save_results_dir, results_name)

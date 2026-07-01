@@ -15,6 +15,8 @@ from lib.test_utils.get_coords import *
 import xml.etree.ElementTree as ET
 import numpy as np
 import os
+
+_IMAGE_IO_POOL = ThreadPoolExecutor(max_workers=8)
 '''
 def pre_process(image, scale=1):
     height, width = image.shape[2:4]
@@ -264,126 +266,50 @@ def read_single_xml(args):
     return np_boxes
 
 def process_single_image_task(args):
-    padding_test = False
-    """
-    单个图像处理任务：读取 -> Resize -> 转灰度(可选)
-    返回: (resized_img_bgr, resized_img_gray, orig_shape)
-    """
-    img_path, target_h, target_w = args
-    im = cv2.imread(img_path)
+    img_path = args
+    im = cv2.imread(img_path, cv2.IMREAD_COLOR)
     if im is None:
         raise ValueError(f"无法读取图像：{img_path}")
-    orig_shape = im.shape[:2] # (h, w)
-    if padding_test:
-        
-        # 处理1080尺寸
-        ########################################################
-        h, w = im.shape[:2]  # 1080, 1920
-        # target_h, target_w = self.resolution_ori[0], self.resolution_ori[1]
-        if h!=target_h or w!=target_w:
-            pad_h = target_h - h  # 8
-            pad_w = target_w - w  # 0
-            # 3. 实施填充 (只在底部填充 8 像素)
-            # 参数顺序：top, bottom, left, right
-            im_resized = cv2.copyMakeBorder(im, 0, pad_h, 0, pad_w, 
-                                        cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        else:
-            im_resized = im
-        ########################################################
-         ###
-    else:
-        im_resized = im
-    # # Resize
-    # im_resized = cv2.resize(im, (target_w, target_h)) # (H, W, 3)
-    
-    # 提前计算灰度 (利用 cv2 的优化，通常比 numpy 快)
-    # 保持维度为 (H, W, 1) 以便后续堆叠
-    im_gray = cv2.cvtColor(im_resized, cv2.COLOR_BGR2GRAY)
-    im_gray = np.expand_dims(im_gray, axis=2) 
-    
-    return im_resized, im_gray, orig_shape
+    im_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)[:, :, None]
+    return im, im_gray, im.shape[:2]
 
 def preprocess(img_list, dataset, xml_list):
     seq_num = len(img_list)
     if seq_num == 0:
         raise ValueError("图像列表为空")
-    
-    target_h, target_w = dataset.resolution[0], dataset.resolution[1] # H, W
-    
-    # ========== 优化：合并读取与预处理任务 ==========
-    # 构造任务参数
-    img_args = [(p, target_h, target_w) for p in img_list]
-    
-    a1 = time.time()
-    
-    # 列表用于收集结果
-    img_batch_list = []
-    gray_batch_list = []
+
+    target_h, target_w = dataset.resolution[0], dataset.resolution[1]
+    results = list(_IMAGE_IO_POOL.map(process_single_image_task, img_list))
+    frame_h, frame_w = results[0][0].shape[:2]
+    img_batch = np.empty((seq_num, frame_h, frame_w, 3), dtype=np.uint8)
+    gray_batch = np.empty((seq_num, frame_h, frame_w, 1), dtype=np.uint8)
+    bbox_seq = np.empty((seq_num, 512, 6), dtype=np.float32)
     xml_args = []
-    
-    with ThreadPoolExecutor(max_workers=8) as executor: # IO密集型可以开大点 workers
-        # 1. 并行处理图像 (Read + Resize + Gray)
-        results = list(executor.map(process_single_image_task, img_args))
-        
-        for i, res in enumerate(results):
-            im_resized, im_gray, orig_shape = res
-            img_batch_list.append(im_resized)
-            gray_batch_list.append(im_gray)
-            
-            # 准备 XML 读取参数
-            xml_args.append((xml_list[i], orig_shape, (target_h, target_w)))
-            
-        # 2. 并行处理 XML (此时图像已经处理完，CPU空闲出来解析XML)
-        bbox_list = list(executor.map(read_single_xml, xml_args))
 
-    a1_io = time.time()
-    
-    # ========== 堆叠与归一化 ==========
-    
-    # 堆叠 -> (N, H, W, 3)  <-- 内存连续性更好
-    img_batch = np.stack(img_batch_list, axis=0)
-    gray_batch = np.stack(gray_batch_list, axis=0) # (N, H, W, 1)
-    bbox_seq = np.stack(bbox_list, axis=0) # (N, 512, 6)
-    
-    # 归一化 (利用广播机制)
-    # mean/std shape: (1, 1, 1, 3) 用于匹配 (N, H, W, 3)
-    mean = dataset.mean.reshape(1, 1, 1, 3).astype(np.float32)
-    std = dataset.std.reshape(1, 1, 1, 3).astype(np.float32)
-    
-    # 转换为 float32 并归一化
-    # 这一步是内存消耗大户，如果内存吃紧，可以考虑原地操作或分块
-    img_batch_float = img_batch.astype(np.float32)
-    imgs_normalized = (img_batch_float / 255.0 - mean) / std
-    
-    # 灰度图不需要 float32 归一化吗？看你原代码没有归一化，只转了 float
-    # 这里保持一致，只转 float32 (N, H, W, 1)
+    for i, (im, im_gray, orig_shape) in enumerate(results):
+        img_batch[i] = im
+        gray_batch[i] = im_gray
+        xml_args.append((xml_list[i], orig_shape, (target_h, target_w)))
+
+    for i, boxes in enumerate(_IMAGE_IO_POOL.map(read_single_xml, xml_args)):
+        bbox_seq[i] = boxes
+
+    mean = np.asarray(dataset.mean, dtype=np.float32).reshape(1, 1, 1, 3)
+    std = np.asarray(dataset.std, dtype=np.float32).reshape(1, 1, 1, 3)
+    imgs_normalized = (img_batch.astype(np.float32) / 255.0 - mean) / std
     inp_gray = gray_batch.astype(np.float32)
-
-    # ========== 维度变换 (N, H, W, C) -> (1, C, N, H, W) ==========
-    
-    # Transpose: (N, H, W, C) -> (C, N, H, W)
-    # 0->1, 1->2, 2->3, 3->0
     inp = np.expand_dims(imgs_normalized.transpose(3, 0, 1, 2), axis=0)
-    
-    # Gray Transpose
     inp_gray = np.expand_dims(inp_gray.transpose(3, 0, 1, 2), axis=0)
-    
-    # Bbox: (1, N, 512, 6)
     inp_bboxes = np.expand_dims(bbox_seq, axis=0)
-    
-    meta = pre_process(inp, 1)
 
+    meta = pre_process(inp, 1)
     batch_dict = {}
     input_imgs = {
-        'input': inp, 
-        'input_gray': inp_gray, 
+        'input': inp,
+        'input_gray': inp_gray,
         'bboxes': inp_bboxes
     }
-    
-    # 此时 img_batch 是 (N, H, W, 3) 且为 uint8，适合可视化
-    # 如果外部需要 (H, W, 3, N)，则 transpose 一下
     img_batch_return = img_batch.transpose(1, 2, 3, 0)
-
     return batch_dict, meta, img_batch_return, input_imgs
 def process(model, batch, return_time, opt, K=128):
     with torch.no_grad():
