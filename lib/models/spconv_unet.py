@@ -21,7 +21,9 @@ from lib.models.cos_update_v12 import SparseSymmetricCosineAttention as SparseSy
 from lib.models.cos_update_v13 import FrameRestrictedSparseTrajectoryTransformer
 from lib.models.cos_update_v14 import ObjectCentricAssociationTokenFusion
 from lib.models.cos_update_v15 import SparseTrajectoryTokenModule
-from lib.models.cos_update_v16 import TripletMotionConsistencySparseConv
+from lib.models.cos_update_v16 import TripletMotionConsistencySparseConv as TripletMotionConsistencySparseConvV16
+from lib.models.cos_update_v17 import TripletMotionConsistencyCosineSparseConv
+from lib.models.cos_update_v18 import TripletMotionConsistencyMotionPairSparseConv
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
@@ -30,6 +32,8 @@ MFE_MODULE_NAMES = (
     'cosv14', 'ocatf', 'object_token',
     'cosv15', 'sttm', 'sparse_traj_token',
     'cosv16', 'tmc', 'tmc_sconv',
+    'cosv17', 'tmc_cos', 'tmc_cos_sconv',
+    'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv',
 )
 
 
@@ -112,14 +116,18 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
     elif mfe_name == 'cosv10':
         mfe_cls = SparseSymmetricCosineAttention
     elif mfe_name in ('cosv16', 'tmc', 'tmc_sconv'):
-        mfe_cls = TripletMotionConsistencySparseConv
+        mfe_cls = TripletMotionConsistencySparseConvV16
+    elif mfe_name in ('cosv17', 'tmc_cos', 'tmc_cos_sconv'):
+        mfe_cls = TripletMotionConsistencyCosineSparseConv
+    elif mfe_name in ('cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConv
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
     if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
         seq_len = getattr(opt, 'seqLen', None)
         if seq_len is not None:
             kwargs['num_frames'] = int(seq_len)
-    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv'):
+    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv'):
         topk_values = parse_triplet_values(getattr(opt, 'tmc_topk', 3), int, 'tmc_topk')
         window_values = parse_triplet_values(getattr(opt, 'tmc_window_size', 11), int, 'tmc_window_size')
         idx = int(tmc_level) if tmc_level is not None else 0

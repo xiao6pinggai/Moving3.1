@@ -1,13 +1,14 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class TripletMotionConsistencySparseConv(nn.Module):
+class TripletMotionConsistencyCosineSparseConv(nn.Module):
     """稀疏时空点的三帧运动一致性更新模块。
 
     改动点：
-    1. top-k 邻居搜索改为真正的窗口内查找，不再对整帧候选点做 dense pairwise distance。
+    1. top-k 邻居搜索改为真正的窗口内查找，并在窗口候选点中按 cosine 相似度选择。
     2. 去掉 GPU -> CPU 的 .item() / .cpu() / .tolist() 同步。
     3. 使用窗口 offset + hash key + searchsorted 做 CUDA 并行查找。
     4. 只对具有 previous-next 有效 triplet 的点计算三元特征与 FFN。
@@ -75,8 +76,7 @@ class TripletMotionConsistencySparseConv(nn.Module):
         nn.init.zeros_(self.pos_mlp[-1].weight)
         nn.init.zeros_(self.pos_mlp[-1].bias)
 
-        # 预先构造窗口内 offset，并按距离从近到远排序。
-        # 后续只需要保留前 K 个有效 offset，即是真正窗口内 top-k。
+        # 预先构造窗口内 offset；邻居最终按 feature cosine 相似度取 top-k。
         coords = torch.arange(
             -self.window_radius,
             self.window_radius + 1,
@@ -84,19 +84,15 @@ class TripletMotionConsistencySparseConv(nn.Module):
         )
         oy, ox = torch.meshgrid(coords, coords, indexing="ij")
         offsets = torch.stack([oy.reshape(-1), ox.reshape(-1)], dim=1)
-        dist2 = offsets[:, 0].square() + offsets[:, 1].square()
-        order = torch.argsort(dist2, stable=True)
-
-        self.register_buffer("window_offsets", offsets[order], persistent=False)
-        self.register_buffer("window_dist2", dist2[order], persistent=False)
+        self.register_buffer("window_offsets", offsets, persistent=False)
 
     @staticmethod
     def _encode_key(b, t, y, x, t_stride, y_stride, x_stride):
         """把 batch/time/y/x 编码成一维 key，用于 CUDA 上的排序和查找。"""
         return (((b * t_stride + t) * y_stride + y) * x_stride + x)
 
-    def _find_triplet_neighbors(self, indices):
-        """真正的窗口内 top-k 邻居查找。
+    def _find_triplet_neighbors(self, indices, features):
+        """窗口内基于 cosine 相似度的 top-k 邻居查找。
 
         输入:
             indices: [N, 4], 格式为 [batch, time, y, x]
@@ -112,11 +108,12 @@ class TripletMotionConsistencySparseConv(nn.Module):
             2. 对 key 排序。
             3. 对每个点并行枚举窗口内所有 offset。
             4. 使用 searchsorted 查找 previous / next 帧中对应坐标是否存在。
-            5. offset 已按距离排序，因此前 K 个有效匹配就是窗口内 top-k。
+            5. 对窗口内有效候选按 cosine 相似度取 top-k。
         """
         device = indices.device
         n_points = indices.shape[0]
         k = self.topk
+        channels = features.shape[1]
 
         coords = indices.long()
         b = coords[:, 0]
@@ -183,22 +180,24 @@ class TripletMotionConsistencySparseConv(nn.Module):
         matched_mask = matched_mask.view(n_points, 2, n_offsets)
         matched_index = matched_index.view(n_points, 2, n_offsets)
 
-        # offsets 已经按距离升序排列。
-        # 对每个点、每个方向，前 K 个有效匹配就是窗口内 top-k。
-        rank = matched_mask.long().cumsum(dim=-1) - 1
-        keep = matched_mask & (rank < k)
-
         out_idx = torch.zeros(n_points, 2, k, dtype=torch.long, device=device)
         out_mask = torch.zeros(n_points, 2, k, dtype=torch.bool, device=device)
 
-        row_ids = torch.arange(n_points, device=device).view(n_points, 1, 1)
-        row_ids = row_ids.expand(n_points, 2, n_offsets)
+        feature_norm = F.normalize(features, p=2, dim=1)
+        cur_norm = feature_norm.view(n_points, 1, 1, channels)
+        cand_norm = feature_norm[matched_index.reshape(-1)]
+        cand_norm = cand_norm.view(n_points, 2, n_offsets, channels)
 
-        dir_ids = torch.arange(2, device=device).view(1, 2, 1)
-        dir_ids = dir_ids.expand(n_points, 2, n_offsets)
+        cosine = (cur_norm * cand_norm).sum(dim=-1)
+        cosine = cosine.masked_fill(~matched_mask, float("-inf"))
 
-        out_idx[row_ids[keep], dir_ids[keep], rank[keep]] = matched_index[keep]
-        out_mask[row_ids[keep], dir_ids[keep], rank[keep]] = True
+        k_select = min(k, n_offsets)
+        top_score, top_pos = torch.topk(cosine, k=k_select, dim=-1, largest=True)
+        top_idx = torch.gather(matched_index, dim=-1, index=top_pos)
+        top_mask = torch.isfinite(top_score)
+
+        out_idx[:, :, :k_select] = top_idx
+        out_mask[:, :, :k_select] = top_mask
 
         idx_prev = out_idx[:, 0]
         idx_next = out_idx[:, 1]
@@ -220,8 +219,8 @@ class TripletMotionConsistencySparseConv(nn.Module):
         n_points, channels = features.shape
         k = self.topk
 
-        # 1. 真正窗口内 top-k previous / next 邻居查找。
-        idx_prev, idx_next, mask_prev, mask_next = self._find_triplet_neighbors(indices)
+        # 1. 窗口内按 cosine 相似度 top-k 的 previous / next 邻居查找。
+        idx_prev, idx_next, mask_prev, mask_next = self._find_triplet_neighbors(indices, features)
 
         # 2. 构造 previous-next triplet 的有效 mask。
         # mask_pair[i, u, v] 表示第 i 个点的第 u 个 prev 和第 v 个 next 是否同时有效。
