@@ -476,7 +476,7 @@ class UNet2DWithNormalConv2D(Module):
 
         self.final_conv = None
         if self.use_final_conv:
-            self.final_conv = Conv2d(feat_channels[0], num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            self.final_conv = Conv2d(feat_channels[0], feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
 
             prior_prob = 0.01
             bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -957,6 +957,99 @@ class TOSConvNet(Module):
                 foreground = x - background
                 x = torch.cat([x, foreground], dim=1)
             x = stage(x)
+        if self.final_conv is not None:
+            x = self.final_conv(x)
+        return x
+
+
+class TemporalPyramidBlock(Module):
+    """Channel-split multi-branch dilated temporal convolution block."""
+
+    def __init__(self, channels, tpdilation, temporal_kernel=3):
+        super().__init__()
+        if not isinstance(tpdilation, (list, tuple)):
+            raise ValueError('tpdilation must be a list or tuple of integers')
+        if len(tpdilation) == 0:
+            raise ValueError('tpdilation must not be empty')
+        if temporal_kernel % 2 == 0:
+            raise ValueError('temporal_kernel must be odd')
+        self.channels = channels
+        self.dilations = [int(dilation) for dilation in tpdilation]
+        self.branch_count = len(self.dilations)
+        if channels % self.branch_count != 0:
+            raise ValueError('channels must be divisible by len(tpdilation)')
+        if min(self.dilations) <= 0:
+            raise ValueError('tpdilation values must be positive')
+        self.branch_channels = channels // self.branch_count
+        self.temporal_kernel = temporal_kernel
+
+        branches = []
+        for dilation in self.dilations:
+            branches.append(nn.Sequential(
+                Conv3d(
+                    self.branch_channels,
+                    self.branch_channels,
+                    kernel_size=(temporal_kernel, 1, 1),
+                    stride=1,
+                    padding=(dilation * (temporal_kernel // 2), 0, 0),
+                    dilation=(dilation, 1, 1),
+                    bias=False,
+                ),
+                BatchNorm3d(self.branch_channels),
+            ))
+        self.branches = nn.ModuleList(branches)
+        self.activation = ReLU(inplace=True)
+
+    def forward(self, x):
+        chunks = torch.chunk(x, self.branch_count, dim=1)
+        out = torch.cat([branch(chunk) for branch, chunk in zip(self.branches, chunks)], dim=1)
+        return self.activation(x + out)
+
+class TPConvNet(Module):
+    """TOSConvNet-style stack with a temporal pyramid after the first Conv-BN-ReLU."""
+
+    def __init__(self, num_channels=3, feat_channels=[16, 32, 64, 128],
+                 residual=None, upsample_mode="trilinear", dropout_prob=0,
+                 activation=None, T_pooling=True, groups=2,
+                 downsample_mode="stride", use_final_conv=True, use_tzsconv='',
+                 seq_len=10, *, tpdilation, tprepeat):
+        super().__init__()
+        self.use_final_conv = use_final_conv
+        self.tpdilation = tpdilation
+        self.tprepeat = int(tprepeat)
+        if self.tprepeat < 0:
+            raise ValueError('tprepeat must be non-negative')
+        if len(feat_channels) == 0:
+            raise ValueError('feat_channels must not be empty')
+
+        stages = []
+        in_channels = num_channels
+        for out_channels in feat_channels:
+            stages.append(nn.Sequential(
+                Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                BatchNorm3d(out_channels),
+                ReLU(inplace=True),
+            ))
+            in_channels = out_channels
+        self.stages = nn.ModuleList(stages)
+        self.tp_blocks = nn.Sequential(*[
+            TemporalPyramidBlock(feat_channels[0], self.tpdilation)
+            for _ in range(self.tprepeat)
+        ])
+
+        self.final_conv = None
+        if self.use_final_conv:
+            self.final_conv = Conv3d(in_channels, feat_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.final_conv.weight.data.normal_(0, 0.01)
+            self.final_conv.bias.data.fill_(bias_value)
+
+    def forward(self, x):
+        for stage_idx, stage in enumerate(self.stages):
+            x = stage(x)
+            if stage_idx == 0:
+                x = self.tp_blocks(x)
         if self.final_conv is not None:
             x = self.final_conv(x)
         return x

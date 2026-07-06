@@ -1,12 +1,13 @@
-import os
-import sys
-
 import torch
 import torch.nn as nn
 
-from lib.models.triplet_topk_loader import load_triplet_topk_exact
-
-triplet_topk_exact = None
+try:
+    from .triplet_topk_cuda import triplet_topk_exact
+except ImportError:  # pragma: no cover
+    try:
+        from triplet_topk_cuda import triplet_topk_exact
+    except ImportError:
+        triplet_topk_exact = None
 
 
 class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
@@ -38,36 +39,19 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         valid_norm=True,
         use_cuda_kernel=True,
         allow_python_fallback=False,
-        topk_relu="fanghui",
         **kwargs,
     ):
         super().__init__()
-        global triplet_topk_exact
-        triplet_topk_exact = load_triplet_topk_exact(topk_relu)
-        del kernel_size, chunk_size
-
-        self.ffn_position = str(kwargs.pop("ffn_position", "before_mean")).lower()
-        for legacy_key in ("use_qkv", "use_maxpool", "use_biqkv"):
-            kwargs.pop(legacy_key, None)
-        if kwargs:
-            raise TypeError(f"Unexpected cosv18 kwargs: {sorted(kwargs)}")
-        if self.ffn_position not in ("before_mean", "after_mean"):
-            raise ValueError(
-                f"ffn_position should be \"before_mean\" or \"after_mean\", got {self.ffn_position}"
-            )
+        del kernel_size, chunk_size, kwargs
 
         self.in_channels = in_channels
         self.alpha = alpha
         self.temporal_dilation = int(temporal_dilation)
-        self.topk = int(topk)
-        if self.topk <= 0:
-            raise ValueError("CUDA v18 currently requires tmc_topk > 0; use the Python baseline for topk<=0 all-pair mode")
+        self.topk = max(1, int(topk))
         self.window_size = max(1, int(window_size))
         self.window_radius = self.window_size // 2
-        # self.pos_scale = float(pos_scale)
-        self.pos_scale = window_size // 2
+        self.pos_scale = float(pos_scale)
         self.valid_norm = bool(valid_norm)
-        self.use_pos_gate = True
         self.conv = conv if conv is not None else nn.Identity()
         self.use_cuda_kernel = bool(use_cuda_kernel)
         self.allow_python_fallback = bool(allow_python_fallback)
@@ -313,9 +297,6 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         has_pair = mask_pair.any(dim=1)
         valid_idx = has_pair.nonzero(as_tuple=False).squeeze(1)
 
-        if valid_idx.numel() == 0:
-            return input_features, features.new_zeros((n_points, 1))
-
         idx_prev_v = idx_prev[valid_idx]
         idx_next_v = idx_next[valid_idx]
         mask_pair_v = mask_pair[valid_idx]
@@ -328,30 +309,30 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
 
         triplet_feat = prev_feat + cur_feat + next_feat
 
-        mask_pair_f = mask_pair_v.unsqueeze(-1).to(triplet_feat.dtype)
-        if self.use_pos_gate:
-            spatial = indices[:, 2:4].to(features.dtype)
+        spatial = indices[:, 2:4].to(features.dtype)
 
-            s_cur = spatial[valid_idx].view(n_valid, 1, 2)
-            s_prev = spatial[idx_prev_v]
-            s_next = spatial[idx_next_v]
+        s_cur = spatial[valid_idx].view(n_valid, 1, 2)
+        s_prev = spatial[idx_prev_v]
+        s_next = spatial[idx_next_v]
 
-            s_minus = s_cur - s_prev
-            s_plus = s_next - s_cur
-            accel = s_plus - s_minus
+        s_minus = s_cur - s_prev
+        s_plus = s_next - s_cur
+        accel = s_plus - s_minus
 
-            motion_input = torch.cat([s_minus, s_plus, accel], dim=-1) / max(self.pos_scale, 1e-6)
+        motion_input = torch.cat([s_minus, s_plus, accel], dim=-1) / max(self.pos_scale, 1e-6)
 
-            pos_score = self.pos_mlp(motion_input.reshape(-1, 6))
-            pos_score = pos_score.view(n_valid, k, 1)
+        pos_score = self.pos_mlp(motion_input.reshape(-1, 6))
+        pos_score = pos_score.view(n_valid, k, 1)
 
-            pos_gate = 2.0 * torch.sigmoid(pos_score)
-            pos_gate = pos_gate * mask_pair_f
-            triplet_input = triplet_feat * pos_gate
-            score_sum = pos_gate.sum(dim=1)
-        else:
-            triplet_input = triplet_feat
-            score_sum = mask_pair_f.sum(dim=1)
+        pos_gate = 2.0 * torch.sigmoid(pos_score)
+        pos_gate = pos_gate * mask_pair_v.unsqueeze(-1).to(pos_gate.dtype)
+
+        triplet_input = triplet_feat * pos_gate
+        triplet_msg = self.ffn(triplet_input.reshape(-1, channels))
+        triplet_msg = triplet_msg.view(n_valid, k, channels)
+        triplet_msg = triplet_msg * mask_pair_v.unsqueeze(-1).to(triplet_msg.dtype)
+
+        msg_sum = triplet_msg.sum(dim=1)
 
         if self.valid_norm:
             denom = mask_pair_v.sum(dim=1)
@@ -359,20 +340,13 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         else:
             denom = features.new_full((n_valid, 1), float(k))
 
-        if self.ffn_position == "before_mean":
-            triplet_msg = self.ffn(triplet_input.reshape(-1, channels))
-            triplet_msg = triplet_msg.view(n_valid, k, channels)
-            triplet_msg = triplet_msg * mask_pair_f.to(triplet_msg.dtype)
-            update_v = triplet_msg.sum(dim=1) / denom
-        else:
-            triplet_input = triplet_input * mask_pair_f.to(triplet_input.dtype)
-            update_v = self.ffn(triplet_input.sum(dim=1) / denom)
+        update_v = msg_sum / denom
         update_v = self.act(self.norm(update_v))
 
         update = features.new_zeros(n_points, channels)
         update[valid_idx] = update_v
 
-        score_v = score_sum / denom.to(score_sum.dtype)
+        score_v = pos_gate.sum(dim=1) / denom.to(pos_gate.dtype)
 
         score = features.new_zeros(n_points, 1)
         score[valid_idx] = score_v

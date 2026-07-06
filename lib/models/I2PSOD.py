@@ -20,7 +20,7 @@ from lib.utils1.bbox2binarymask import bboxes_to_binary_mask
 from lib.models.spconv_unet import UNetV2, UNetV2_3, UNetV2_2, UNetV2_3_32, UNetV2_3_T_nodown, UNetV2_3_T_nodown_maxpool, UNetV2_3_T_nodown_v2, UNetV2_3_T_nodown_v3
 from lib.models.spconv_utils import replace_feature, spconv
 
-from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D, EncoderOnlyConv3DProposalNet, TOSConvNet, TZSConvNet, DynamicTOSConvNet
+from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D, EncoderOnlyConv3DProposalNet, TOSConvNet, TPConvNet, TZSConvNet, DynamicTOSConvNet
 
 
 
@@ -37,10 +37,10 @@ class Img2PointsSmallObjectDetection(nn.Module):
         self.net1name=net1name
         temporal_mode = getattr(opt, 'use_tzsconv', 'tzsconv')
         
-        if net1name=='UNet3DWithNormalConv3D':
+        if net1name in ('UNet3DWithNormalConv3D', 'Unet3'):
             self.I2PNet = UNet3DWithNormalConv3D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True,TConvOnly=False)
-        elif net1name=='UNet2DWithNormalConv2D':
+        elif net1name in ('UNet2DWithNormalConv2D', 'Unet2'):
             self.I2PNet = UNet2DWithNormalConv2D(num_channels=3, num_classes=1, feat_channels=feat_channels, residual=None, 
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode, use_final_conv=True)
         elif net1name=='LightWeightedConv3D':
@@ -54,6 +54,11 @@ class Img2PointsSmallObjectDetection(nn.Module):
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
                                  use_final_conv=True, use_tzsconv=temporal_mode,
                                  seq_len=img_num)
+        elif net1name=='TPConvNet':
+            self.I2PNet = TPConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
+                                 upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,
+                                 use_final_conv=True, use_tzsconv=temporal_mode,
+                                 seq_len=img_num, tpdilation=opt.tpdilation, tprepeat=opt.tprepeat)
         elif net1name in ('DynamicTOSConvNet', 'DynamicTOSconvNet'):
             self.I2PNet = DynamicTOSConvNet(num_channels=3, feat_channels=feat_channels, residual=None,
                                  upsample_mode="trilinear", activation=None,T_pooling=T_pooling,groups=groups,downsample_mode=downsample_mode,

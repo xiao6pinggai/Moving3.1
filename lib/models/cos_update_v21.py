@@ -10,13 +10,17 @@ triplet_topk_exact = None
 
 
 class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
-    """V18: CUDA exact pair top-k version.
+    """V21: CUDA exact pair top-k with per-branch position gates.
 
     CUDA extension only replaces neighbor pair selection:
         indices/index_map/window_offsets -> idx_prev/idx_next/mask_pair
 
-    Trainable layer names are kept compatible with the previous module:
+    Trainable layer names are mostly kept compatible with the previous module:
         prev_proj, cur_proj, next_proj, pos_mlp, ffn, norm
+
+    Compared with V18, the position MLP outputs 3 gates for prev/cur/next.
+    The gated triplet feature is:
+        gate_prev * prev_proj + gate_cur * cur_proj + gate_next * next_proj
 
     The selected pair semantics remain the original replacement-allowed pair top-k:
         the same previous point or next point may appear in multiple selected pairs.
@@ -50,7 +54,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         for legacy_key in ("use_qkv", "use_maxpool", "use_biqkv"):
             kwargs.pop(legacy_key, None)
         if kwargs:
-            raise TypeError(f"Unexpected cosv18 kwargs: {sorted(kwargs)}")
+            raise TypeError(f"Unexpected cosv21 kwargs: {sorted(kwargs)}")
         if self.ffn_position not in ("before_mean", "after_mean"):
             raise ValueError(
                 f"ffn_position should be \"before_mean\" or \"after_mean\", got {self.ffn_position}"
@@ -61,7 +65,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         self.temporal_dilation = int(temporal_dilation)
         self.topk = int(topk)
         if self.topk <= 0:
-            raise ValueError("CUDA v18 currently requires tmc_topk > 0; use the Python baseline for topk<=0 all-pair mode")
+            raise ValueError("CUDA v21 currently requires tmc_topk > 0; use the Python baseline for topk<=0 all-pair mode")
         self.window_size = max(1, int(window_size))
         self.window_radius = self.window_size // 2
         # self.pos_scale = float(pos_scale)
@@ -82,7 +86,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         self.pos_mlp = nn.Sequential(
             nn.Linear(6, pos_hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(pos_hidden, 1),
+            nn.Linear(pos_hidden, 3),
         )
 
         self.ffn = nn.Sequential(
@@ -326,9 +330,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         cur_feat = self.cur_proj(features[valid_idx]).view(n_valid, 1, channels)
         next_feat = self.next_proj(features[idx_next_v.reshape(-1)]).view(n_valid, k, channels)
 
-        triplet_feat = prev_feat + cur_feat + next_feat
-
-        mask_pair_f = mask_pair_v.unsqueeze(-1).to(triplet_feat.dtype)
+        mask_pair_f = mask_pair_v.unsqueeze(-1).to(features.dtype)
         if self.use_pos_gate:
             spatial = indices[:, 2:4].to(features.dtype)
 
@@ -343,13 +345,18 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             motion_input = torch.cat([s_minus, s_plus, accel], dim=-1) / max(self.pos_scale, 1e-6)
 
             pos_score = self.pos_mlp(motion_input.reshape(-1, 6))
-            pos_score = pos_score.view(n_valid, k, 1)
+            pos_score = pos_score.view(n_valid, k, 3)
 
             pos_gate = 2.0 * torch.sigmoid(pos_score)
             pos_gate = pos_gate * mask_pair_f
-            triplet_input = triplet_feat * pos_gate
-            score_sum = pos_gate.sum(dim=1)
+            triplet_input = (
+                prev_feat * pos_gate[..., 0:1]
+                + cur_feat * pos_gate[..., 1:2]
+                + next_feat * pos_gate[..., 2:3]
+            )
+            score_sum = pos_gate.mean(dim=-1, keepdim=True).sum(dim=1)
         else:
+            triplet_feat = prev_feat + cur_feat + next_feat
             triplet_input = triplet_feat
             score_sum = mask_pair_f.sum(dim=1)
 
@@ -381,4 +388,4 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
 
 
 # Optional explicit alias for versioned imports.
-TripletMotionConsistencyMotionPairSparseConvV18 = TripletMotionConsistencyMotionPairSparseConv
+TripletMotionConsistencyMotionPairSparseConvV21 = TripletMotionConsistencyMotionPairSparseConv

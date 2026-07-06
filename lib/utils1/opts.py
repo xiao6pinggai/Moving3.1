@@ -5,21 +5,36 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+import ast
 from datetime import datetime
 import platform  # 导入系统识别模块
+
+
+def _parse_int_list(value):
+    if isinstance(value, list):
+        tokens = value
+    else:
+        text = value.strip()
+        if text.startswith('[') or text.startswith('('):
+            tokens = ast.literal_eval(text)
+        else:
+            tokens = [token.strip() for token in text.split(',') if token.strip()]
+    if not isinstance(tokens, (list, tuple)):
+        raise argparse.ArgumentTypeError('tpdilation must be a list of integers')
+    return [int(token) for token in tokens]
+
 class opts(object):
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         # basic experiment setting
-        self.parser.add_argument('--discribe', default='v18_cuda_001_w7_k9_motionpairtopk_scalerposgate_zc_halfwindows') # 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
+        self.parser.add_argument('--discribe', default='seq10sample10_baseline_unet3_8888') #v21_cuda_bottle_w7_k5_weightedposgate 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
         self.parser.add_argument('--task', default='ctdet_points',
                                  help='task name.  ctdet_points |  ctdet ')
-        self.parser.add_argument('--exp_name', default='v18_cuda_001_w7_k9_motionpairtopk_scalerposgate_zc_halfwindows', # 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
+        self.parser.add_argument('--exp_name',default='seq10sample10_baseline_unet3_8888_111_321',# 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
                                  help='name of the experiments.')
-        self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3
+        self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3        
         self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3
-        self.parser.add_argument('--load_model', default= '',
-                                 help='path to pretrained model')
+        self.parser.add_argument('--load_model', default= '')
         self.parser.add_argument('--resume', type=bool, default=True, help='resume an experiment.')
         self.parser.add_argument('--down_ratio', type=int, default=1, help='output stride. Currently only supports for 1.')
         # system
@@ -63,7 +78,7 @@ class opts(object):
         # dataset
         self.parser.add_argument('--data_mode', type=str, default='multi',
                                  help='dataset name.')
-        self.parser.add_argument('--datasetname', type=str, default='rs_car_new', # rs_car # aircraft # rs_car_new # sdm_car # mir  修改8
+        self.parser.add_argument('--datasetname', type=str, default='sdm_car', # rs_car # aircraft # rs_car_new # sdm_car # mir  修改8
                                  help='dataset name.')
         # self.parser.add_argument('--data_dir', type=str, default='/root/autodl-tmp/RsCarData_New_Part/',  #/root/autodl-tmp/RsCarData/', # /root/autodl-tmp/AircraftDataset23/
         #                          # 注意以 / 结尾
@@ -108,22 +123,26 @@ class opts(object):
         self.parser.add_argument('--stage1_epochs', type=int, default=10, help='number of epochs for stage 1 training.')
         
         # net1 define
-        self.parser.add_argument('--feat_channels', type=list, default=[16,16], help='unet upsample channels') # [8,16,32,64] for Unet3DWithNormalConv3D # [8,16,32,16,8] for LightWeightedConv3D
+        self.parser.add_argument('--feat_channels', type=list, default=[8,8,8,8], help='unet upsample channels') # [8,16,32,64] for Unet3DWithNormalConv3D # [8,16,32,16,8] for LightWeightedConv3D # [16,16]
         self.parser.add_argument('--T_pooling', type=bool, default=False,  help='is pooling t dim or not')
         self.parser.add_argument('--groups', type=int, default=-1, help='net1 conv groups(must be feat_channels % == 0)')
         self.parser.add_argument('--downsample_mode', type=str, default='maxpool', help='downsample mode "stride" or "maxpool"')
-        self.parser.add_argument('--net1name', type=str, default='TOSConvNet', help='encoder use ATDC, supports TOSConvNet/DynamicTOSConvNet/TZSConvNet/TZSconvNet') # LightWeightedConv3D  # UNet3DWithNormalConv3D # TOSConvNet  # TZSConvNet # 修改11
-        self.parser.add_argument('--use_tzsconv', type=str, default='tzsconv', help='temporal branch mode: "tzsconv" keeps the current branch, "tmf" uses temporal median filtering in TOSConvNet, "" disables it')
-        self.parser.add_argument('--MFE', type=str, default="cosv18")
-        self.parser.add_argument('--bottle_enhancement', type=str, default='block', help='bottleneck enhancement: None removes the middle block, block keeps the original conv block, MFE names such as cosv18 use the corresponding MFE module')
-        self.parser.add_argument('--MFE_skip', type=str, default='[0,0,1]', help='MFE skip switches for [conv1, conv2, conv3], e.g. [1,0,1]')
-        self.parser.add_argument('--tmc_topk', type=str, default='[7,3,9]', help='cosv18 top-k per [conv1, conv2, conv3]; single value is broadcast')
-        self.parser.add_argument('--tmc_window_size', type=str, default='[51,25,7]', help='cosv18 window size per [conv1, conv2, conv3]; single value is broadcast')
-        self.parser.add_argument('--tmc_hidden_ratio', type=float, default=0.5, help='cosv18 FFN hidden channel ratio')
-        self.parser.add_argument('--tmc_pos_hidden', type=int, default=16, help='cosv18 position MLP hidden channels')
-        self.parser.add_argument('--tmc_pos_scale', type=float, default=16.0, help='cosv18 coordinate normalization scale')
-        self.parser.add_argument('--tmc_chunk_size', type=int, default=0, help='cosv18 query chunk size; <=0 uses adaptive large-block chunking')
-        self.parser.add_argument('--tmc_ffn_position', type=str, default='before_mean', choices=['before_mean', 'after_mean'], help='cosv18 FFN placement: before_mean keeps per-pair FFN; after_mean applies FFN after pair averaging')
+        self.parser.add_argument('--net1name', type=str, default='Unet3', help='encoder use ATDC, supports TOSConvNet/TPConvNet/DynamicTOSConvNet/TZSConvNet/TZSconvNet/Unet3/Unet2') # LightWeightedConv3D  # UNet3DWithNormalConv3D # TOSConvNet  # TZSConvNet # 修改11
+        self.parser.add_argument('--use_tzsconv', type=str, default='', help='temporal branch mode: "tzsconv" keeps the current branch, "tmf" uses temporal median filtering in TOSConvNet, "" disables it')
+        self.parser.add_argument('--tpdilation', type=_parse_int_list, default=[1,2,3,4], help='TPConvNet temporal pyramid dilations, e.g. [1,2,3,4]')
+        self.parser.add_argument('--tprepeat', type=int, default=3, help='repeat count of the TPConvNet temporal pyramid block')
+        self.parser.add_argument('--MFE', type=str, default="cosv23")
+        self.parser.add_argument('--bottle_enhancement', type=str, default='block', help='bottleneck enhancement: None removes the middle block, block keeps the original conv block, MFE names such as cosv18 use the corresponding MFE module, MFEw2Block uses block-MFE-block at bottleneck')
+        self.parser.add_argument('--MFE_skip', type=str, default='[1,1,1]', help='MFE skip switches for [conv1, conv2, conv3], e.g. [1,0,1]')
+        self.parser.add_argument('--MFErepeat', type=str, default='[0,0,0]', help='cosv22 repeat count per [conv1, conv2, conv3]; single value is broadcast')
+        self.parser.add_argument('--topk_relu', type=str, default='fanghui', choices=['fanghui', 'bufanghui'], help='triplet top-k matching rule: fanghui allows point reuse, bufanghui forbids reuse')
+        self.parser.add_argument('--tmc_topk', type=str, default='[3,2,1]', help='cosv18/v20/v21/v23 top-k per [conv1, conv2, conv3]; single value is broadcast')
+        self.parser.add_argument('--tmc_window_size', type=str, default='[15,11,7]', help='cosv18/v20/v21/v23 window size per [conv1, conv2, conv3]; single value is broadcast')
+        self.parser.add_argument('--tmc_hidden_ratio', type=float, default=0.5, help='cosv18/v20/v21/v23 FFN hidden channel ratio')
+        self.parser.add_argument('--tmc_pos_hidden', type=int, default=16, help='cosv18/v21 position MLP hidden channels; v20 uses 0.5*C')
+        self.parser.add_argument('--tmc_pos_scale', type=float, default=16.0, help='cosv18/v20/v21/v23 coordinate normalization scale')
+        self.parser.add_argument('--tmc_chunk_size', type=int, default=0, help='cosv18/v20/v21/v23 query chunk size; <=0 uses adaptive large-block chunking')
+        self.parser.add_argument('--tmc_ffn_position', type=str, default='before_mean', choices=['before_mean', 'after_mean'], help='cosv18/v21 FFN placement: before_mean keeps per-pair FFN; after_mean applies FFN after pair averaging')
         #可视化 # cosv10 
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
         self.parser.add_argument('--vis_mode', type=str, default='mean', help='feature map aggregation mode: mean / max / channel index (e.g. 0 1 2)')
@@ -157,7 +176,7 @@ class opts(object):
             opt.batch_size= 6
         elif opt.seqLen == 20:
             opt.data_sampling = 10
-            opt.batch_size= 4
+            opt.batch_size= 8
         opt.lr = 1e-3/4*opt.batch_size
         if opt.datasetname == 'rs_car_new':
             opt.data_dir = '/root/autodl-tmp/RsCarData_New_Part/'

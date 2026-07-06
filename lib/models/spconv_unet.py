@@ -24,6 +24,10 @@ from lib.models.cos_update_v15 import SparseTrajectoryTokenModule
 from lib.models.cos_update_v16 import TripletMotionConsistencySparseConv as TripletMotionConsistencySparseConvV16
 from lib.models.cos_update_v17 import TripletMotionConsistencyCosineSparseConv
 from lib.models.cos_update_v18 import TripletMotionConsistencyMotionPairSparseConv
+from lib.models.cos_update_v20 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV20
+from lib.models.cos_update_v21 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV21
+from lib.models.cos_update_v22 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV22
+from lib.models.cos_update_v23 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV23
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
@@ -34,7 +38,12 @@ MFE_MODULE_NAMES = (
     'cosv16', 'tmc', 'tmc_sconv',
     'cosv17', 'tmc_cos', 'tmc_cos_sconv',
     'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv',
+    'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv',
+    'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv',
+    'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv',
+    'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv',
 )
+BOTTLE_MFE_WITH_2_BLOCK = 'mfew2block'
 
 
 def parse_optional_module_name(value):
@@ -121,11 +130,19 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         mfe_cls = TripletMotionConsistencyCosineSparseConv
     elif mfe_name in ('cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv'):
         mfe_cls = TripletMotionConsistencyMotionPairSparseConv
+    elif mfe_name in ('cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConvV20
+    elif mfe_name in ('cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConvV21
+    elif mfe_name in ('cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConvV22
+    elif mfe_name in ('cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConvV23
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
     if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
         kwargs['num_frames'] = int(opt.seqLen)
-    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv'):
+    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv', 'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv', 'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv', 'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv', 'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv'):
         topk_values = parse_triplet_values(opt.tmc_topk, int, 'tmc_topk')
         window_values = parse_triplet_values(opt.tmc_window_size, int, 'tmc_window_size')
         idx = int(tmc_level) if tmc_level is not None else 0
@@ -136,8 +153,13 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         kwargs.setdefault('pos_scale', float(opt.tmc_pos_scale))
         kwargs.setdefault('chunk_size', int(opt.tmc_chunk_size))
         kwargs.setdefault('ffn_position', opt.tmc_ffn_position)
+        kwargs.setdefault('topk_relu', opt.topk_relu)
+        if mfe_name in ('cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv'):
+            repeat_values = parse_triplet_values(opt.MFErepeat, int, 'MFErepeat')
+            kwargs.setdefault('repeat', int(repeat_values[idx]))
     return mfe_cls(*args, **kwargs)
   
+
 class UNetV2_3_T_nodown_v2(nn.Module):
     """
     Sparse Convolution based UNet for point-wise feature learning.
@@ -212,51 +234,36 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         )
 
         self.x_bottle_down = spconv.SparseSequential(
-            block(
-                64, 128, 3,
-                norm_fn=norm_fn,
-                stride=(1, 2, 2),
-                padding=1,
-                indice_key='spconv_b',
-                conv_type='spconv',
-            ),
+            block(64, 128, 3, norm_fn=norm_fn, stride=(1, 2, 2), padding=1, indice_key='spconv_b', conv_type='spconv'),
         )
 
         if self.bottle_enhancement == 'block':
-            self.x_bottle_enhancement = block(
-                128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3'
-            )
+            self.x_bottle_enhancement = block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_3')
+        elif self.bottle_enhancement == BOTTLE_MFE_WITH_2_BLOCK:
+            bottle_mfe_name = parse_optional_module_name(getattr(self.opt, 'MFE', None))
+            if bottle_mfe_name not in MFE_MODULE_NAMES:
+                bottle_mfe_name = 'cosv18'
+            self.x_bottle_pre_block = block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_mfe_pre')
+            self.x_bottle_enhancement = build_mfe_module(
+                bottle_mfe_name, opt=self.opt, tmc_level=2, in_channels=128,
+                kernel_size=3, use_qkv=False, use_maxpool=False, alpha=0.5,
+                use_biqkv=False, temporal_dilation=1, conv=spconv.SparseSequential())
+            self.x_bottle_post_block = block(128, 128, 3, norm_fn=norm_fn, padding=1, indice_key='bottle_mfe_post')
         elif self.bottle_enhancement in MFE_MODULE_NAMES:
             self.x_bottle_enhancement = build_mfe_module(
-                self.bottle_enhancement,
-                opt=self.opt,
-                tmc_level=2,
-                in_channels=128,
-                kernel_size=3,
-                use_qkv=False,
-                use_maxpool=False,
-                alpha=0.5,
-                use_biqkv=False,
-                temporal_dilation=1,
-                conv=spconv.SparseSequential(),
-            )
+                self.bottle_enhancement, opt=self.opt, tmc_level=2, in_channels=128,
+                kernel_size=3, use_qkv=False, use_maxpool=False, alpha=0.5,
+                use_biqkv=False, temporal_dilation=1, conv=spconv.SparseSequential())
         elif self.bottle_enhancement is None:
             self.x_bottle_enhancement = None
         else:
             raise ValueError(
                 f'Unknown bottle_enhancement: {self.bottle_enhancement}. '
-                f'Expected None, "block", or one of {MFE_MODULE_NAMES}.'
+                f'Expected None, "block", "{BOTTLE_MFE_WITH_2_BLOCK}", or one of {MFE_MODULE_NAMES}.'
             )
 
         self.x_bottle_up = spconv.SparseSequential(
-            block(
-                128, 64, 3,
-                stride=(1, 2, 2),
-                padding=1,
-                norm_fn=norm_fn,
-                indice_key='spconv_b',
-                conv_type='inverseconv',
-            ),
+            block(128, 64, 3, stride=(1, 2, 2), padding=1, norm_fn=norm_fn, indice_key='spconv_b', conv_type='inverseconv'),
         )
 
         # ------------------------------------------------------------------
@@ -266,62 +273,26 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # ------------------------------------------------------------------
 
         if self.MFE in MFE_MODULE_NAMES:
-            self.sptial2d1 = block(
-                16, 16, (1, 3, 3),
-                norm_fn=norm_fn,
-                dialtion=(1, 1, 1),
-                padding=(0, 1, 1),
-                indice_key='subm1_1',
-            ) if False else spconv.SparseSequential()
-            self.sptial2d2 = block(
-                32, 32, (1, 3, 3),
-                norm_fn=norm_fn,
-                dialtion=(1, 1, 1),
-                padding=(0, 1, 1),
-                indice_key='subm2_2',
-            ) if False else spconv.SparseSequential()
-            self.sptial2d3 = block(
-                64, 64, (1, 3, 3),
-                norm_fn=norm_fn,
-                dialtion=(1, 1, 1),
-                padding=(0, 1, 1),
-                indice_key='subm3_3',
-            ) if False else spconv.SparseSequential()
+            self.sptial2d1 = block(16, 16, (1, 3, 3), norm_fn=norm_fn,
+                dialtion=(1, 1, 1), padding=(0, 1, 1), indice_key='subm1_1') if False else spconv.SparseSequential()
+            self.sptial2d2 = block(32, 32, (1, 3, 3), norm_fn=norm_fn,
+                dialtion=(1, 1, 1), padding=(0, 1, 1), indice_key='subm2_2') if False else spconv.SparseSequential()
+            self.sptial2d3 = block(64, 64, (1, 3, 3), norm_fn=norm_fn,
+                dialtion=(1, 1, 1), padding=(0, 1, 1), indice_key='subm3_3') if False else spconv.SparseSequential()
 
 
             self.shortcut1 = build_mfe_module(self.MFE, opt=self.opt,
-                tmc_level=0,
-                in_channels=16,
-                kernel_size=9,
-                use_qkv=False,
-                use_maxpool=False,
-                alpha=0.5,
-                use_biqkv=False,
-                temporal_dilation=1,
-                conv=self.sptial2d1,
-            )
+                tmc_level=0, in_channels=16, kernel_size=9,
+                use_qkv=False, use_maxpool=False, alpha=0.5,
+                use_biqkv=False, temporal_dilation=1, conv=self.sptial2d1)
             self.shortcut2 = build_mfe_module(self.MFE, opt=self.opt,
-                tmc_level=1,
-                in_channels=32,
-                kernel_size=7,
-                use_qkv=False,
-                use_maxpool=False,
-                alpha=0.5,
-                use_biqkv=False,
-                temporal_dilation=1,
-                conv=self.sptial2d2,
-            )
+                tmc_level=1, in_channels=32, kernel_size=7,
+                use_qkv=False, use_maxpool=False, alpha=0.5,
+                use_biqkv=False, temporal_dilation=1, conv=self.sptial2d2)
             self.shortcut3 = build_mfe_module(self.MFE, opt=self.opt,
-                tmc_level=2,
-                in_channels=64,
-                kernel_size=5,
-                use_qkv=False,
-                use_maxpool=False,
-                alpha=0.5,
-                use_biqkv=False,
-                temporal_dilation=1,
-                conv=self.sptial2d3,
-            )
+                tmc_level=2, in_channels=64, kernel_size=5,
+                use_qkv=False, use_maxpool=False, alpha=0.5,
+                use_biqkv=False, temporal_dilation=1, conv=self.sptial2d3)
 
 
         # if self.MFE in ('cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token'):
@@ -358,51 +329,25 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         #   skip1 16 + up2 16 -> 16 -> output
         # ------------------------------------------------------------------
         # 跳线连接前
-        self.conv_up_t3 = SparseBasicBlock(
-            64, 64,
-            indice_key='subm3',
-            norm_fn=norm_fn,
-        ) if False else spconv.SparseSequential()
+        self.conv_up_t3 = SparseBasicBlock(64, 64, indice_key='subm3', norm_fn=norm_fn) if False else spconv.SparseSequential()
         self.conv_up_m3 = block(
             128, 64, 3,
             norm_fn=norm_fn,
             padding=1,
             indice_key='subm3',
         )
-        self.inv_conv3 = block(
-            64, 32, 3,
-            stride=(1, 2, 2),
-            padding=1,
-            norm_fn=norm_fn,
-            indice_key='spconv3',
-            conv_type='inverseconv',
-        )
+        self.inv_conv3 = block(64, 32, 3, stride=(1, 2, 2), padding=1, norm_fn=norm_fn, indice_key='spconv3', conv_type='inverseconv')
         # 跳线连接前
-        self.conv_up_t2 = SparseBasicBlock(
-            32, 32,
-            indice_key='subm2',
-            norm_fn=norm_fn,
-        ) if False else spconv.SparseSequential()
+        self.conv_up_t2 = SparseBasicBlock(32, 32, indice_key='subm2', norm_fn=norm_fn) if False else spconv.SparseSequential()
         self.conv_up_m2 = block(
             64, 32, 3,
             norm_fn=norm_fn,
             padding=1,
             indice_key='subm2',
         )
-        self.inv_conv2 = block(
-            32, 16, 3,
-            stride=(1, 2, 2),
-            padding=1,
-            norm_fn=norm_fn,
-            indice_key='spconv2',
-            conv_type='inverseconv',
-        )
+        self.inv_conv2 = block(32, 16, 3, stride=(1, 2, 2), padding=1, norm_fn=norm_fn, indice_key='spconv2', conv_type='inverseconv')
         # 跳线连接前
-        self.conv_up_t1 = SparseBasicBlock(
-            16, 16,
-            indice_key='subm1',
-            norm_fn=norm_fn,
-        ) if False else spconv.SparseSequential()
+        self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn) if False else spconv.SparseSequential()
         self.conv_up_m1 = block(
             32, 16, 3,
             norm_fn=norm_fn,
@@ -410,9 +355,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             indice_key='subm1',
         )
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
 
         self.num_point_features = 16
         self.out_channel = 16
@@ -476,12 +419,23 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         x_conv2 = self.conv2(x_conv1)
         x_conv3 = self.conv3(x_conv2)
 
-        x_bottle = self.x_bottle_down(x_conv3)
+        
         if self.bottle_enhancement == 'block':
+            x_bottle = self.x_bottle_down(x_conv3)
             x_bottle = self.x_bottle_enhancement(x_bottle)
-        elif self.bottle_enhancement in MFE_MODULE_NAMES:
+            x_bottle = self.x_bottle_up(x_bottle)
+        elif self.bottle_enhancement == BOTTLE_MFE_WITH_2_BLOCK:
+            x_bottle = self.x_bottle_down(x_conv3)
+            x_bottle = self.x_bottle_pre_block(x_bottle)
             x_bottle = replace_feature(x_bottle, self.x_bottle_enhancement(x_bottle)[0])
-        x_bottle = self.x_bottle_up(x_bottle)
+            x_bottle = self.x_bottle_post_block(x_bottle)
+            x_bottle = self.x_bottle_up(x_bottle)
+        elif self.bottle_enhancement in MFE_MODULE_NAMES:
+            x_bottle = self.x_bottle_down(x_conv3)
+            x_bottle = replace_feature(x_bottle, self.x_bottle_enhancement(x_bottle)[0])
+            x_bottle = self.x_bottle_up(x_bottle)
+        elif not self.bottle_enhancement:
+            x_bottle = spconv.SparseSequential(x_conv3)
 
         # ------------------------------------------------------------------
         # Decoder
@@ -532,10 +486,12 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         batch_dict['encoded_spconv_tensor_stride'] = 8
 
         return batch_dict
-    
+###################################################################################################################
 # 阅读代码时，以下请忽略，本工程中仅使用UNetV2_3_T_nodown_v2类，以下保留仅为参考。
 # 阅读代码时，以下请忽略，本工程中仅使用UNetV2_3_T_nodown_v2类，以下保留仅为参考。
 # 阅读代码时，以下请忽略，本工程中仅使用UNetV2_3_T_nodown_v2类，以下保留仅为参考。
+######################v2备份，新版增加unet的宽度，每层3卷积##########################
+
 
 class SparseBasicBlock(spconv.SparseModule):
     expansion = 1
@@ -696,9 +652,7 @@ class UNetV2(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
@@ -866,9 +820,7 @@ class UNetV2_3(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
@@ -1038,9 +990,7 @@ class UNetV2_2(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
@@ -1209,9 +1159,7 @@ class UNetV2_3_32(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(32, 32, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(64, 32, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(32, 32, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(32, 32, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 32
 
         self.out_channel = 32
@@ -1380,9 +1328,7 @@ class UNetV2_3_T_nodown(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
@@ -1571,9 +1517,7 @@ class UNetV2_3_T_nodown_maxpool(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
@@ -1794,9 +1738,7 @@ class UNetV2_3_T_nodown_v2_bf(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
@@ -2002,27 +1944,12 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
         # ------------------------------------------------------------------
 
         if self.MFE in ('cosv10', 'cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
-            self.sptial2d1 = block(
-                16, 16, (1, 3, 3),
-                norm_fn=norm_fn,
-                dialtion=(1, 1, 1),
-                padding=(0, 1, 1),
-                indice_key='subm1_1',
-            )
-            self.sptial2d2 = block(
-                32, 32, (1, 3, 3),
-                norm_fn=norm_fn,
-                dialtion=(1, 1, 1),
-                padding=(0, 1, 1),
-                indice_key='subm2_2',
-            )
-            self.sptial2d3 = block(
-                64, 64, (1, 3, 3),
-                norm_fn=norm_fn,
-                dialtion=(1, 1, 1),
-                padding=(0, 1, 1),
-                indice_key='subm3_3',
-            )if False else spconv.SparseSequential()
+            self.sptial2d1 = block(16, 16, (1, 3, 3), norm_fn=norm_fn,
+                dialtion=(1, 1, 1), padding=(0, 1, 1), indice_key='subm1_1')
+            self.sptial2d2 = block(32, 32, (1, 3, 3), norm_fn=norm_fn,
+                dialtion=(1, 1, 1), padding=(0, 1, 1), indice_key='subm2_2')
+            self.sptial2d3 = block(64, 64, (1, 3, 3), norm_fn=norm_fn,
+                dialtion=(1, 1, 1), padding=(0, 1, 1), indice_key='subm3_3') if False else spconv.SparseSequential()
 
 
             self.shortcut1 = build_mfe_module(self.MFE, opt=self.opt,
@@ -2118,51 +2045,25 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
             conv_type='inverseconv',
         )
         # 跳线连接前
-        self.conv_up_t3 = SparseBasicBlock(
-            64, 64,
-            indice_key='subm3',
-            norm_fn=norm_fn,
-        ) if False else spconv.SparseSequential()
+        self.conv_up_t3 = SparseBasicBlock(64, 64, indice_key='subm3', norm_fn=norm_fn) if False else spconv.SparseSequential()
         self.conv_up_m3 = block(
             128, 64, 3,
             norm_fn=norm_fn,
             padding=1,
             indice_key='subm3',
         )
-        self.inv_conv3 = block(
-            64, 32, 3,
-            stride=(1, 2, 2),
-            padding=1,
-            norm_fn=norm_fn,
-            indice_key='spconv3',
-            conv_type='inverseconv',
-        )
+        self.inv_conv3 = block(64, 32, 3, stride=(1, 2, 2), padding=1, norm_fn=norm_fn, indice_key='spconv3', conv_type='inverseconv')
         # 跳线连接前
-        self.conv_up_t2 = SparseBasicBlock(
-            32, 32,
-            indice_key='subm2',
-            norm_fn=norm_fn,
-        ) if False else spconv.SparseSequential()
+        self.conv_up_t2 = SparseBasicBlock(32, 32, indice_key='subm2', norm_fn=norm_fn) if False else spconv.SparseSequential()
         self.conv_up_m2 = block(
             64, 32, 3,
             norm_fn=norm_fn,
             padding=1,
             indice_key='subm2',
         )
-        self.inv_conv2 = block(
-            32, 16, 3,
-            stride=(1, 2, 2),
-            padding=1,
-            norm_fn=norm_fn,
-            indice_key='spconv2',
-            conv_type='inverseconv',
-        )
+        self.inv_conv2 = block(32, 16, 3, stride=(1, 2, 2), padding=1, norm_fn=norm_fn, indice_key='spconv2', conv_type='inverseconv')
         # 跳线连接前
-        self.conv_up_t1 = SparseBasicBlock(
-            16, 16,
-            indice_key='subm1',
-            norm_fn=norm_fn,
-        ) if False else spconv.SparseSequential()
+        self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn) if False else spconv.SparseSequential()
         self.conv_up_m1 = block(
             32, 16, 3,
             norm_fn=norm_fn,
@@ -2170,9 +2071,7 @@ class UNetV2_3_T_nodown_v2_bfbf(nn.Module):
             indice_key='subm1',
         )
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
 
         self.num_point_features = 16
         self.out_channel = 16
@@ -2421,9 +2320,7 @@ class UNetV2_3_T_nodown_v3(nn.Module):
         self.conv_up_t1 = SparseBasicBlock(16, 16, indice_key='subm1', norm_fn=norm_fn)
         self.conv_up_m1 = block(32, 16, 3, norm_fn=norm_fn, indice_key='subm1')
 
-        self.conv5 = spconv.SparseSequential(
-            block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1')
-        )
+        self.conv5 = spconv.SparseSequential(block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'))
         self.num_point_features = 16
 
         self.out_channel = 16
