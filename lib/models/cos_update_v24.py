@@ -1,19 +1,21 @@
+import ast
+
 import torch
 import torch.nn as nn
 
 from lib.models.feature_topk_v23_loader import load_feature_topk_v23_exact
-from lib.models.spconv_utils import replace_feature
 
 feature_topk_v23_exact = None
 
 
 class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
-    """V23: feature-nearest prev/next candidates with marginalized trajectory attention.
+    """V24: multi-temporal-dilation channel-split variant of V23.
 
-    For each current sparse point, candidates are selected independently from the
-    previous and next temporal windows by the smallest feature-distance to the
-    current point. The K x K pair attention is used only to produce marginal
-    weights for O(K) prev/next value aggregation.
+    ``tpdilation`` controls the temporal offsets. Channels are split across the
+    dilation branches; when the channel count is not divisible, the first branch
+    receives the remainder. Each branch performs the V23 prev/next trajectory
+    attention on its own channel slice and temporal dilation, then all slices are
+    merged before the shared FFN.
     """
 
     def __init__(
@@ -22,6 +24,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         kernel_size=5,
         alpha=0.5,
         temporal_dilation=1,
+        tpdilation=None,
         conv=None,
         topk=3,
         window_size=11,
@@ -39,7 +42,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         super().__init__()
         self.quanjuduiji = False
         self.wbianyuanhua = True # 与False等价，True计算量更小
-        self.k_laiyuan = 'coords' # features # coords
+        self.k_laiyuan = 'coords'
         self.add_sa = False
         self.useFFN = True
         del kernel_size, alpha, valid_norm, topk_relu
@@ -48,13 +51,22 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         for legacy_key in ("use_qkv", "use_maxpool", "use_biqkv"):
             kwargs.pop(legacy_key, None)
         if kwargs:
-            raise TypeError(f"Unexpected cosv23 kwargs: {sorted(kwargs)}")
+            raise TypeError(f"Unexpected cosv24 kwargs: {sorted(kwargs)}")
 
         self.in_channels = int(in_channels)
-        self.temporal_dilation = int(temporal_dilation)
+        self.tpdilation = self._parse_tpdilation(tpdilation, temporal_dilation)
+        self.temporal_dilation = int(self.tpdilation[0])
+        self.channel_splits = self._split_channels(self.in_channels, len(self.tpdilation))
+        self.channel_offsets = []
+        start = 0
+        for split_channels in self.channel_splits:
+            end = start + split_channels
+            self.channel_offsets.append((start, end))
+            start = end
+
         self.topk = int(topk)
         if self.topk <= 0:
-            raise ValueError("cosv23 requires tmc_topk > 0")
+            raise ValueError("cosv24 requires tmc_topk > 0")
 
         self.window_size = max(1, int(window_size))
         self.window_radius = self.window_size // 2
@@ -76,29 +88,39 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         self.norm_sa_attn = nn.LayerNorm(in_channels) if self.add_sa else None
         self.norm_sa_ffn = nn.LayerNorm(in_channels) if self.add_sa and self.useFFN else None
 
-        self.q_proj = nn.Linear(in_channels, in_channels, bias=False)
-        self.cur_proj = nn.Linear(in_channels, in_channels, bias=False)
-        self.prev_proj = nn.Linear(in_channels, in_channels, bias=False)
-        self.next_proj = nn.Linear(in_channels, in_channels, bias=False)
-        self.k_cur_proj = nn.Linear(in_channels, in_channels, bias=False) if use_feature_keys else None
-        self.k_prev_proj = nn.Linear(in_channels, in_channels, bias=False) if use_feature_keys else None
-        self.k_next_proj = nn.Linear(in_channels, in_channels, bias=False) if use_feature_keys else None
-        self.out_proj = nn.Linear(in_channels, in_channels, bias=False)
-
+        self.q_proj = nn.ModuleList()
+        self.cur_proj = nn.ModuleList()
+        self.prev_proj = nn.ModuleList()
+        self.next_proj = nn.ModuleList()
+        self.k_cur_proj = nn.ModuleList() if use_feature_keys else None
+        self.k_prev_proj = nn.ModuleList() if use_feature_keys else None
+        self.k_next_proj = nn.ModuleList() if use_feature_keys else None
+        self.out_proj = nn.ModuleList()
+        self.traj_mlp = nn.ModuleList() if use_coord_keys else None
         self.sa_q_proj = nn.Linear(in_channels, in_channels, bias=False) if self.add_sa else None
         self.sa_k_proj = nn.Linear(in_channels, in_channels, bias=False) if self.add_sa else None
         self.sa_v_proj = nn.Linear(in_channels, in_channels, bias=False) if self.add_sa else None
         self.sa_out_proj = nn.Linear(in_channels, in_channels, bias=False) if self.add_sa else None
-
-        self.traj_mlp = (
-            nn.Sequential(
-                nn.Linear(6, pos_hidden),
-                nn.ReLU(inplace=True),
-                nn.Linear(pos_hidden, in_channels),
-            )
-            if use_coord_keys
-            else None
-        )
+        self.scales = []
+        for split_channels in self.channel_splits:
+            self.q_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+            self.cur_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+            self.prev_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+            self.next_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+            if use_feature_keys:
+                self.k_cur_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+                self.k_prev_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+                self.k_next_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+            self.out_proj.append(nn.Linear(split_channels, split_channels, bias=False))
+            if use_coord_keys:
+                self.traj_mlp.append(
+                    nn.Sequential(
+                        nn.Linear(6, pos_hidden),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(pos_hidden, split_channels),
+                    )
+                )
+            self.scales.append(split_channels ** -0.5)
 
         jitter_hidden = max(4, int(round(in_channels * 0.5)))
         self.global_jitter_mlp = (
@@ -129,8 +151,8 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             if self.add_sa and self.useFFN
             else None
         )
+        self.sa_scale = in_channels ** -0.5
 
-        self.scale = in_channels ** -0.5
         if self.global_jitter_mlp is not None:
             nn.init.zeros_(self.global_jitter_mlp[-1].weight)
             nn.init.zeros_(self.global_jitter_mlp[-1].bias)
@@ -146,6 +168,41 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         offset_order = torch.argsort(offset_cost, stable=True).to(torch.long)
         offsets = offsets[offset_order].contiguous()
         self.register_buffer("window_offsets", offsets, persistent=False)
+
+    @staticmethod
+    def _parse_tpdilation(tpdilation, temporal_dilation):
+        if tpdilation is None:
+            values = [int(temporal_dilation)]
+        elif isinstance(tpdilation, str):
+            text = tpdilation.strip()
+            if text.startswith("[") or text.startswith("("):
+                values = ast.literal_eval(text)
+            elif "," in text:
+                values = [token.strip() for token in text.split(",") if token.strip()]
+            else:
+                values = [token.strip() for token in text.split() if token.strip()]
+        elif isinstance(tpdilation, (list, tuple)):
+            values = list(tpdilation)
+        else:
+            values = [tpdilation]
+        values = [int(value) for value in values]
+        if not values:
+            raise ValueError("cosv24 requires tpdilation to contain at least one value")
+        if any(value <= 0 for value in values):
+            raise ValueError(f"cosv24 tpdilation values must be positive, got {values}")
+        return values
+
+    @staticmethod
+    def _split_channels(in_channels, n_branches):
+        if n_branches <= 0:
+            raise ValueError("n_branches must be positive")
+        if in_channels < n_branches:
+            raise ValueError(
+                f"cosv24 requires in_channels >= len(tpdilation), got {in_channels} and {n_branches}"
+            )
+        base = int(in_channels) // int(n_branches)
+        remainder = int(in_channels) - base * int(n_branches)
+        return [base + remainder] + [base] * (n_branches - 1)
 
     def _load_from_state_dict(
         self,
@@ -290,7 +347,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         cand = index_map[safe_b, safe_t, safe_y, safe_x].long()
         return torch.where(valid, cand, cand.new_full(cand.shape, -1))
 
-    def _select_topk_by_feature_distance(self, indices, features_norm, index_map):
+    def _select_topk_by_feature_distance(self, indices, features_norm, index_map, temporal_dilation):
         n_points, channels = features_norm.shape
         k = self.topk
 
@@ -312,7 +369,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
                     index_map=index_map,
                     features=features_norm,
                     window_offsets=self.window_offsets.to(device=indices.device),
-                    temporal_dilation=self.temporal_dilation,
+                    temporal_dilation=int(temporal_dilation),
                     topk=self.topk,
                 )
 
@@ -334,14 +391,14 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
                 query_features,
                 features_norm,
                 index_map,
-                temporal_offset=-self.temporal_dilation,
+                temporal_offset=-int(temporal_dilation),
             )
             next_idx, next_mask = self._select_one_side(
                 query_indices,
                 query_features,
                 features_norm,
                 index_map,
-                temporal_offset=self.temporal_dilation,
+                temporal_offset=int(temporal_dilation),
             )
 
             out_prev[start:end] = prev_idx
@@ -388,14 +445,14 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         pooled = pooled / counts.clamp_min(1.0)
         return pooled.view(B, T, channels), counts.view(B, T, 1) > 0
 
-    def _predict_global_jitter_by_frame(self, features, indices, B, T):
+    def _predict_global_jitter_by_frame(self, features, indices, B, T, temporal_dilation):
         frame_pool, frame_has = self._global_average_pool_frames(features, indices, B, T)
         device = features.device
         batch_grid = torch.arange(B, device=device).view(B, 1).expand(B, T)
         time_grid = torch.arange(T, device=device).view(1, T).expand(B, T)
 
-        prev_time = time_grid - self.temporal_dilation
-        next_time = time_grid + self.temporal_dilation
+        prev_time = time_grid - int(temporal_dilation)
+        next_time = time_grid + int(temporal_dilation)
         valid_prev = (prev_time >= 0) & (prev_time < T)
         valid_next = (next_time >= 0) & (next_time < T)
         safe_prev_time = prev_time.clamp(0, max(T - 1, 0))
@@ -481,7 +538,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             key = self.sa_k_proj(f_nei)
             value = self.sa_v_proj(f_nei)
 
-            attn = (q * key).sum(dim=-1) * self.scale
+            attn = (q * key).sum(dim=-1) * self.sa_scale
             attn = attn.masked_fill(~mask_v, -1e4)
             attn = torch.softmax(attn, dim=-1)
             attn = attn * mask_v.to(attn.dtype)
@@ -501,8 +558,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         if input_features.numel() == 0:
             return input_features, input_features.new_zeros((input_features.shape[0], 1))
 
-        x_conv =    self.conv(x)
-        # x_conv = x
+        x_conv = self.conv(x)
         indices = x_conv.indices
         features = x_conv.features
         n_points, channels = features.shape
@@ -512,119 +568,131 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         features_norm = self.norm_attn(features)
         if self.quanjuduiji:
             B, T, _, _ = dense_index_map.shape
-            prev_global_delta, next_global_delta = self._predict_global_jitter_by_frame(
-                features_norm,
-                indices,
-                B,
-                T,
-            )
+            global_deltas = [
+                self._predict_global_jitter_by_frame(features_norm, indices, B, T, dilation)
+                for dilation in self.tpdilation
+            ]
         else:
-            prev_global_delta = None
-            next_global_delta = None
+            global_deltas = [(None, None) for _ in self.tpdilation]
 
-        idx_prev, idx_next, mask_prev, mask_next = self._select_topk_by_feature_distance(
-            indices,
-            features_norm,
-            dense_index_map,
-        )
-
-        has_pair = mask_prev.any(dim=1) & mask_next.any(dim=1)
-        valid_idx = has_pair.nonzero(as_tuple=False).squeeze(1)
-
-        if valid_idx.numel() == 0:
-            return input_features, features.new_zeros((n_points, 1))
-
-        update = input_features.new_zeros(n_points, channels)
+        attn_update = input_features.new_zeros(n_points, channels)
         score = features.new_zeros(n_points, 1)
+        valid_any = torch.zeros(n_points, dtype=torch.bool, device=features.device)
         spatial = indices[:, 2:4].to(features.dtype)
 
-        pair_chunk = self._adaptive_chunk_size(valid_idx.numel(), k * k, channels, pair_factor=1)
-        for start in range(0, valid_idx.numel(), pair_chunk):
-            end = min(start + pair_chunk, valid_idx.numel())
-            rows = valid_idx[start:end]
-            n_valid = rows.shape[0]
+        for branch_id, dilation in enumerate(self.tpdilation):
+            ch_start, ch_end = self.channel_offsets[branch_id]
+            split_channels = ch_end - ch_start
+            features_part = features_norm[:, ch_start:ch_end].contiguous()
 
-            idx_prev_v = idx_prev[rows]
-            idx_next_v = idx_next[rows]
-            mask_prev_v = mask_prev[rows]
-            mask_next_v = mask_next[rows]
-            pair_mask = mask_prev_v.unsqueeze(2) & mask_next_v.unsqueeze(1)
-
-            f_cur_res = input_features[rows]
-            f_cur = features_norm[rows]
-            f_prev = features_norm[idx_prev_v.reshape(-1)].view(n_valid, k, channels)
-            f_next = features_norm[idx_next_v.reshape(-1)].view(n_valid, k, channels)
-
-            q = self.q_proj(f_cur).view(n_valid, 1, 1, channels)
-            cur_value = self.cur_proj(f_cur)
-            prev_value = self.prev_proj(f_prev)
-            next_value = self.next_proj(f_next)
-
-            s_cur = spatial[rows].view(n_valid, 1, 1, 2)
-            s_prev = spatial[idx_prev_v].view(n_valid, k, 1, 2)
-            s_next = spatial[idx_next_v].view(n_valid, 1, k, 2)
-
-            d_minus = s_cur - s_prev
-            d_plus = s_next - s_cur
-            if prev_global_delta is not None and next_global_delta is not None:
-                row_coords = indices[rows].long()
-                batch_ids = row_coords[:, 0]
-                time_ids = row_coords[:, 1]
-                prev_delta = prev_global_delta[batch_ids, time_ids].view(n_valid, 1, 1, 2)
-                next_delta = next_global_delta[batch_ids, time_ids].view(n_valid, 1, 1, 2)
-                d_minus = d_minus + prev_delta
-                d_plus = d_plus - next_delta
-            accel = d_plus - d_minus
-            motion_input = torch.cat(
-                [
-                    d_minus.expand(-1, -1, k, -1),
-                    d_plus.expand(-1, k, -1, -1),
-                    accel,
-                ],
-                dim=-1,
+            idx_prev, idx_next, mask_prev, mask_next = self._select_topk_by_feature_distance(
+                indices,
+                features_part,
+                dense_index_map,
+                dilation,
             )
-            motion_input = motion_input / max(self.pos_scale, 1e-6)
 
-            if self.k_laiyuan == 'coords':
-                traj_key = self.traj_mlp(motion_input.reshape(-1, 6)).view(n_valid, k, k, channels)
-            elif self.k_laiyuan == 'features':
-                cur_key = self.k_cur_proj(f_cur).view(n_valid, 1, 1, channels)
-                prev_key = self.k_prev_proj(f_prev).view(n_valid, k, 1, channels)
-                next_key = self.k_next_proj(f_next).view(n_valid, 1, k, channels)
-                traj_key = cur_key + prev_key + next_key
-            else:
-                raise ValueError(f"Unsupported k_laiyuan: {self.k_laiyuan}")
-            attn = (q * traj_key).sum(dim=-1) * self.scale
-            attn = attn.masked_fill(~pair_mask, -1e4)
-            attn = torch.softmax(attn.view(n_valid, k * k), dim=-1).view(n_valid, k, k)
-            attn = attn * pair_mask.to(attn.dtype)
-            attn = attn / attn.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+            has_pair = mask_prev.any(dim=1) & mask_next.any(dim=1)
+            valid_idx = has_pair.nonzero(as_tuple=False).squeeze(1)
+            if valid_idx.numel() == 0:
+                continue
 
-            if self.wbianyuanhua:
-                w_prev = attn.sum(dim=2)
-                w_next = attn.sum(dim=1)
-                h_prev = (w_prev.unsqueeze(-1) * prev_value).sum(dim=1)
-                h_next = (w_next.unsqueeze(-1) * next_value).sum(dim=1)
-                value = cur_value + h_prev + h_next
-            else:
-                pair_value = (
-                    cur_value.view(n_valid, 1, 1, channels)
-                    + prev_value.view(n_valid, k, 1, channels)
-                    + next_value.view(n_valid, 1, k, channels)
+            valid_any[valid_idx] = True
+            prev_global_delta, next_global_delta = global_deltas[branch_id]
+            pair_chunk = self._adaptive_chunk_size(valid_idx.numel(), k * k, split_channels, pair_factor=1)
+            for start in range(0, valid_idx.numel(), pair_chunk):
+                end = min(start + pair_chunk, valid_idx.numel())
+                rows = valid_idx[start:end]
+                n_valid = rows.shape[0]
+
+                idx_prev_v = idx_prev[rows]
+                idx_next_v = idx_next[rows]
+                mask_prev_v = mask_prev[rows]
+                mask_next_v = mask_next[rows]
+                pair_mask = mask_prev_v.unsqueeze(2) & mask_next_v.unsqueeze(1)
+
+                f_cur = features_part[rows]
+                f_prev = features_part[idx_prev_v.reshape(-1)].view(n_valid, k, split_channels)
+                f_next = features_part[idx_next_v.reshape(-1)].view(n_valid, k, split_channels)
+
+                q = self.q_proj[branch_id](f_cur).view(n_valid, 1, 1, split_channels)
+                cur_value = self.cur_proj[branch_id](f_cur)
+                prev_value = self.prev_proj[branch_id](f_prev)
+                next_value = self.next_proj[branch_id](f_next)
+
+                s_cur = spatial[rows].view(n_valid, 1, 1, 2)
+                s_prev = spatial[idx_prev_v].view(n_valid, k, 1, 2)
+                s_next = spatial[idx_next_v].view(n_valid, 1, k, 2)
+
+                d_minus = s_cur - s_prev
+                d_plus = s_next - s_cur
+                if prev_global_delta is not None and next_global_delta is not None:
+                    row_coords = indices[rows].long()
+                    batch_ids = row_coords[:, 0]
+                    time_ids = row_coords[:, 1]
+                    prev_delta = prev_global_delta[batch_ids, time_ids].view(n_valid, 1, 1, 2)
+                    next_delta = next_global_delta[batch_ids, time_ids].view(n_valid, 1, 1, 2)
+                    d_minus = d_minus + prev_delta
+                    d_plus = d_plus - next_delta
+                accel = d_plus - d_minus
+                motion_input = torch.cat(
+                    [
+                        d_minus.expand(-1, -1, k, -1),
+                        d_plus.expand(-1, k, -1, -1),
+                        accel,
+                    ],
+                    dim=-1,
                 )
-                value = (attn.unsqueeze(-1) * pair_value).sum(dim=(1, 2))
+                motion_input = motion_input / max(self.pos_scale, 1e-6)
 
-            attn_update = self.out_proj(value)
-            x_attn = f_cur_res + attn_update
-            # x_attn = self.conv(replace_feature(x_conv, input_features.index_copy(0, rows, x_attn))).features[rows] # 添加空间卷积传播逐点计算的注意力
+                if self.k_laiyuan == 'coords':
+                    traj_key = self.traj_mlp[branch_id](motion_input.reshape(-1, 6)).view(
+                        n_valid, k, k, split_channels
+                    )
+                elif self.k_laiyuan == 'features':
+                    cur_key = self.k_cur_proj[branch_id](f_cur).view(n_valid, 1, 1, split_channels)
+                    prev_key = self.k_prev_proj[branch_id](f_prev).view(n_valid, k, 1, split_channels)
+                    next_key = self.k_next_proj[branch_id](f_next).view(n_valid, 1, k, split_channels)
+                    traj_key = cur_key + prev_key + next_key
+                else:
+                    raise ValueError(f"Unsupported k_laiyuan: {self.k_laiyuan}")
+                attn = (q * traj_key).sum(dim=-1) * self.scales[branch_id]
+                attn = attn.masked_fill(~pair_mask, -1e4)
+                attn = torch.softmax(attn.view(n_valid, k * k), dim=-1).view(n_valid, k, k)
+                attn = attn * pair_mask.to(attn.dtype)
+                attn = attn / attn.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+
+                if self.wbianyuanhua:
+                    w_prev = attn.sum(dim=2)
+                    w_next = attn.sum(dim=1)
+                    h_prev = (w_prev.unsqueeze(-1) * prev_value).sum(dim=1)
+                    h_next = (w_next.unsqueeze(-1) * next_value).sum(dim=1)
+                    value = cur_value + h_prev + h_next
+                else:
+                    pair_value = (
+                        cur_value.view(n_valid, 1, 1, split_channels)
+                        + prev_value.view(n_valid, k, 1, split_channels)
+                        + next_value.view(n_valid, 1, k, split_channels)
+                    )
+                    value = (attn.unsqueeze(-1) * pair_value).sum(dim=(1, 2))
+
+                branch_update = self.out_proj[branch_id](value)
+                attn_update[rows, ch_start:ch_end] = branch_update
+                branch_score = attn.amax(dim=(1, 2), keepdim=False).unsqueeze(1)
+                score[rows] = torch.maximum(score[rows], branch_score)
+
+        valid_idx = valid_any.nonzero(as_tuple=False).squeeze(1)
+        if valid_idx.numel() == 0:
+            output_features = input_features
+        else:
+            update = input_features.new_zeros(n_points, channels)
+            x_attn = input_features[valid_idx] + attn_update[valid_idx]
             out_v = x_attn + self.ffn(self.norm_ffn(x_attn)) if self.useFFN else x_attn
+            update[valid_idx] = out_v - input_features[valid_idx]
+            output_features = input_features + update
 
-            update[rows] = out_v - f_cur_res
-            score[rows] = attn.amax(dim=(1, 2), keepdim=False).unsqueeze(1)
-
-        output_features = input_features + update
         output_features = self._apply_self_attention(output_features, indices, dense_index_map)
         return output_features, score
 
 
-TripletMotionConsistencyMotionPairSparseConvV23 = TripletMotionConsistencyMotionPairSparseConv
+TripletMotionConsistencyMotionPairSparseConvV24 = TripletMotionConsistencyMotionPairSparseConv

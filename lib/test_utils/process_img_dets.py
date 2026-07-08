@@ -16,7 +16,17 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import os
 
-_IMAGE_IO_POOL = ThreadPoolExecutor(max_workers=8)
+_IMAGE_IO_POOL = None
+_IMAGE_IO_POOL_PID = None
+
+
+def _get_image_io_pool():
+    global _IMAGE_IO_POOL, _IMAGE_IO_POOL_PID
+    pid = os.getpid()
+    if _IMAGE_IO_POOL is None or _IMAGE_IO_POOL_PID != pid:
+        _IMAGE_IO_POOL = ThreadPoolExecutor(max_workers=8)
+        _IMAGE_IO_POOL_PID = pid
+    return _IMAGE_IO_POOL
 '''
 def pre_process(image, scale=1):
     height, width = image.shape[2:4]
@@ -279,7 +289,8 @@ def preprocess(img_list, dataset, xml_list):
         raise ValueError("图像列表为空")
 
     target_h, target_w = dataset.resolution[0], dataset.resolution[1]
-    results = list(_IMAGE_IO_POOL.map(process_single_image_task, img_list))
+    image_io_pool = _get_image_io_pool()
+    results = list(image_io_pool.map(process_single_image_task, img_list))
     frame_h, frame_w = results[0][0].shape[:2]
     img_batch = np.empty((seq_num, frame_h, frame_w, 3), dtype=np.uint8)
     gray_batch = np.empty((seq_num, frame_h, frame_w, 1), dtype=np.uint8)
@@ -291,7 +302,7 @@ def preprocess(img_list, dataset, xml_list):
         gray_batch[i] = im_gray
         xml_args.append((xml_list[i], orig_shape, (target_h, target_w)))
 
-    for i, boxes in enumerate(_IMAGE_IO_POOL.map(read_single_xml, xml_args)):
+    for i, boxes in enumerate(image_io_pool.map(read_single_xml, xml_args)):
         bbox_seq[i] = boxes
 
     mean = np.asarray(dataset.mean, dtype=np.float32).reshape(1, 1, 1, 3)

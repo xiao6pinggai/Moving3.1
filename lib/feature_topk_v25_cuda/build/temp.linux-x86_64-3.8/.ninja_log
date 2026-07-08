@@ -1,0 +1,6 @@
+# ninja log v7
+0	22761	1783483514759321805	/root/autodl-tmp/Moving3.1/lib/feature_topk_v25_cuda/build/temp.linux-x86_64-3.8/feature_topk_v25_ext.o	9f75c22771138134
+1	40512	1783483514759321805	/root/autodl-tmp/Moving3.1/lib/feature_topk_v25_cuda/build/temp.linux-x86_64-3.8/feature_topk_v25_ext_kernel.o	2184d33097014c11
+14	39448	1783494312773708754	/root/autodl-tmp/Moving3.1/lib/feature_topk_v25_cuda/build/temp.linux-x86_64-3.8/feature_topk_v25_ext_kernel.o	2184d33097014c11
+14	45098	1783494921145960691	/root/autodl-tmp/Moving3.1/lib/feature_topk_v25_cuda/build/temp.linux-x86_64-3.8/feature_topk_v25_ext_kernel.o	2184d33097014c11
+16	43387	1783496168672682471	/root/autodl-tmp/Moving3.1/lib/feature_topk_v25_cuda/build/temp.linux-x86_64-3.8/feature_topk_v25_ext_kernel.o	2184d33097014c11

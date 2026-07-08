@@ -13,6 +13,71 @@ from concurrent.futures import ThreadPoolExecutor
 import GPUtil
 import scipy.io as scio
 import gc
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+
+class _TestPatchDatasetView:
+    def __init__(self, data_val):
+        self.resolution = data_val.resolution
+        self.mean = data_val.mean
+        self.std = data_val.std
+
+
+class _TestPatchPreprocessDataset(Dataset):
+    def __init__(self, patch_infos, data_val):
+        self.patch_infos = patch_infos
+        self.data_val = _TestPatchDatasetView(data_val)
+
+    def __len__(self):
+        return len(self.patch_infos)
+
+    def __getitem__(self, index):
+        _, patch_ims_path, patch_xml_path, _ = self.patch_infos[index]
+        batch_dict, meta, patch_imgs, input_batch = preprocess(patch_ims_path, self.data_val, patch_xml_path)
+        for key, value in list(input_batch.items()):
+            if key != "batch_size":
+                input_batch[key] = torch.from_numpy(value)
+        return batch_dict, meta, patch_imgs, input_batch
+
+
+def _test_patch_collate(batch):
+    return batch[0]
+
+
+def _build_test_patch_loader(patch_infos, data_val, opt):
+    num_workers = max(0, int(getattr(opt, "num_workers", 0)))
+    loader_kwargs = {
+        "dataset": _TestPatchPreprocessDataset(patch_infos, data_val),
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "collate_fn": _test_patch_collate,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(2, int(getattr(opt, "prefetch_factor", 2)))
+    return DataLoader(**loader_kwargs)
+
+
+class _PatchDataLoaderSubmitter:
+    def __init__(self, loader):
+        self.loader_iter = iter(loader)
+        self.executor = None
+
+    def __enter__(self):
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.executor.shutdown(wait=True)
+        return False
+
+    def submit(self, *args, **kwargs):
+        del args, kwargs
+        return self.executor.submit(next, self.loader_iter)
+
+
 def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3, DataVal=None):
     test_net1 = False # 生成坐标txt
     run_eval_net1 = False # 计算坐标与bbox的recall和iou覆盖率
@@ -135,7 +200,8 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
                 ]
                 patch_infos.append((patch_ims, patch_ims_path, patch_xml_path, video_frame_id))
 
-            with ThreadPoolExecutor(max_workers=1) as preprocess_pool:
+            patch_loader = _build_test_patch_loader(patch_infos, DataVal, opt)
+            with _PatchDataLoaderSubmitter(patch_loader) as preprocess_pool:
                 next_future = preprocess_pool.submit(preprocess, patch_infos[0][1], DataVal, patch_infos[0][2])
                 for pk, (patch_ims, patch_ims_path, _, video_frame_id) in enumerate(patch_infos):
                     time_start = time.time()
@@ -153,7 +219,10 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
                     for k in input_batch:
                         if k == 'batch_size':
                             continue
-                        input_batch[k] = torch.from_numpy(input_batch[k]).to(opt.device)
+                        if torch.is_tensor(input_batch[k]):
+                            input_batch[k] = input_batch[k].to(opt.device, non_blocking=True)
+                        else:
+                            input_batch[k] = torch.from_numpy(input_batch[k]).to(opt.device, non_blocking=True)
                     time_start1 = time.time()
                     output, dets = process(model, input_batch, return_time, opt, opt.K) # output==z
                     if False:
