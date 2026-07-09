@@ -120,16 +120,22 @@ __device__ __forceinline__ float l2_feature_distance(
 
 template <typename scalar_t>
 __global__ void feature_topk_v25_kernel(
-    const int* __restrict__ indices,          // [N, 4]
-    const int* __restrict__ index_map,        // [B, T, H, W], invalid = -1
-    const scalar_t* __restrict__ features,    // [N, C]
-    const int* __restrict__ window_offsets,   // [O, 2], sorted by spatial radius
-    int64_t* __restrict__ out_prev,           // [N, K]
-    int64_t* __restrict__ out_cur,            // [N, K]
-    int64_t* __restrict__ out_next,           // [N, K]
-    bool* __restrict__ mask_prev,             // [N, K]
-    bool* __restrict__ mask_cur,              // [N, K]
-    bool* __restrict__ mask_next,             // [N, K]
+    const int* __restrict__ indices,
+    const int* __restrict__ index_map,
+    const scalar_t* __restrict__ features,
+    const int* __restrict__ window_offsets,
+    int64_t* __restrict__ out_prev,
+    int64_t* __restrict__ out_cur,
+    int64_t* __restrict__ out_next,
+    bool* __restrict__ mask_prev,
+    bool* __restrict__ mask_cur,
+    bool* __restrict__ mask_next,
+    float* __restrict__ dist_prev,
+    float* __restrict__ dist_cur,
+    float* __restrict__ dist_next,
+    int64_t* __restrict__ pos_prev,
+    int64_t* __restrict__ pos_cur,
+    int64_t* __restrict__ pos_next,
     int N,
     int C,
     int B,
@@ -137,16 +143,17 @@ __global__ void feature_topk_v25_kernel(
     int H,
     int W,
     int O,
-    int temporal_dilation,
     int K
 ) {
     const int row = blockIdx.x;
     if (row >= N) return;
 
+    const int curK = K - 1;
     const int b = indices[row * 4 + 0];
     const int t = indices[row * 4 + 1];
     const int y = indices[row * 4 + 2];
     const int x = indices[row * 4 + 3];
+    const int center_pos = O / 2;
 
     extern __shared__ unsigned char smem_raw[];
     float* sm_prev_dist = reinterpret_cast<float*>(smem_raw);
@@ -183,26 +190,34 @@ __global__ void feature_topk_v25_kernel(
 
     __syncthreads();
 
+    const bool has_prev = t > 0;
+    const bool has_next = t + 1 < T;
     for (int oid = threadIdx.x; oid < O; oid += blockDim.x) {
         const int off_y = window_offsets[oid * 2 + 0];
         const int off_x = window_offsets[oid * 2 + 1];
 
-        const int prev_idx = get_index_map_4d_i32(index_map, b, t - temporal_dilation, y + off_y, x + off_x, B, T, H, W);
-        if (prev_idx >= 0) {
-            const float dist = l2_feature_distance(features, row, prev_idx, C);
-            insert_dist_topk(dist, oid, prev_idx, sm_prev_dist + base, sm_prev_rank + base, sm_prev_idx + base, K);
+        if (has_prev) {
+            const int prev_idx = get_index_map_4d_i32(index_map, b, t - 1, y + off_y, x + off_x, B, T, H, W);
+            if (prev_idx >= 0) {
+                const float dist = l2_feature_distance(features, row, prev_idx, C);
+                insert_dist_topk(dist, oid, prev_idx, sm_prev_dist + base, sm_prev_rank + base, sm_prev_idx + base, K);
+            }
         }
 
-        const int cur_idx = get_index_map_4d_i32(index_map, b, t, y + off_y, x + off_x, B, T, H, W);
-        if (cur_idx >= 0) {
-            const float dist = l2_feature_distance(features, row, cur_idx, C);
-            insert_dist_topk(dist, oid, cur_idx, sm_cur_dist + base, sm_cur_rank + base, sm_cur_idx + base, K);
+        if (curK > 0) {
+            const int cur_idx = get_index_map_4d_i32(index_map, b, t, y + off_y, x + off_x, B, T, H, W);
+            if (cur_idx >= 0 && cur_idx != row) {
+                const float dist = l2_feature_distance(features, row, cur_idx, C);
+                insert_dist_topk(dist, oid, cur_idx, sm_cur_dist + base, sm_cur_rank + base, sm_cur_idx + base, curK);
+            }
         }
 
-        const int next_idx = get_index_map_4d_i32(index_map, b, t + temporal_dilation, y + off_y, x + off_x, B, T, H, W);
-        if (next_idx >= 0) {
-            const float dist = l2_feature_distance(features, row, next_idx, C);
-            insert_dist_topk(dist, oid, next_idx, sm_next_dist + base, sm_next_rank + base, sm_next_idx + base, K);
+        if (has_next) {
+            const int next_idx = get_index_map_4d_i32(index_map, b, t + 1, y + off_y, x + off_x, B, T, H, W);
+            if (next_idx >= 0) {
+                const float dist = l2_feature_distance(features, row, next_idx, C);
+                insert_dist_topk(dist, oid, next_idx, sm_next_dist + base, sm_next_rank + base, sm_next_idx + base, K);
+            }
         }
     }
 
@@ -227,17 +242,19 @@ __global__ void feature_topk_v25_kernel(
                 if (sm_prev_rank[th_base + k] < INF_RANK) {
                     insert_dist_topk(sm_prev_dist[th_base + k], sm_prev_rank[th_base + k], sm_prev_idx[th_base + k], final_prev_dist, final_prev_rank, final_prev_idx, K);
                 }
-                if (sm_cur_rank[th_base + k] < INF_RANK) {
-                    insert_dist_topk(sm_cur_dist[th_base + k], sm_cur_rank[th_base + k], sm_cur_idx[th_base + k], final_cur_dist, final_cur_rank, final_cur_idx, K);
-                }
                 if (sm_next_rank[th_base + k] < INF_RANK) {
                     insert_dist_topk(sm_next_dist[th_base + k], sm_next_rank[th_base + k], sm_next_idx[th_base + k], final_next_dist, final_next_rank, final_next_idx, K);
+                }
+                if (curK > 0 && k < curK && sm_cur_rank[th_base + k] < INF_RANK) {
+                    insert_dist_topk(sm_cur_dist[th_base + k], sm_cur_rank[th_base + k], sm_cur_idx[th_base + k], final_cur_dist, final_cur_rank, final_cur_idx, curK);
                 }
             }
         }
 
         sort_small_topk(final_prev_dist, final_prev_rank, final_prev_idx, K);
-        sort_small_topk(final_cur_dist, final_cur_rank, final_cur_idx, K);
+        if (curK > 0) {
+            sort_small_topk(final_cur_dist, final_cur_rank, final_cur_idx, curK);
+        }
         sort_small_topk(final_next_dist, final_next_rank, final_next_idx, K);
 
         for (int k = 0; k < K; ++k) {
@@ -245,23 +262,42 @@ __global__ void feature_topk_v25_kernel(
             if (final_prev_rank[k] < INF_RANK) {
                 out_prev[out_pos] = static_cast<int64_t>(final_prev_idx[k]);
                 mask_prev[out_pos] = true;
+                dist_prev[out_pos] = final_prev_dist[k];
+                pos_prev[out_pos] = static_cast<int64_t>(final_prev_rank[k]);
             } else {
                 out_prev[out_pos] = 0;
                 mask_prev[out_pos] = false;
+                dist_prev[out_pos] = INF_DIST;
+                pos_prev[out_pos] = 0;
             }
-            if (final_cur_rank[k] < INF_RANK) {
-                out_cur[out_pos] = static_cast<int64_t>(final_cur_idx[k]);
+
+            if (k == 0) {
+                out_cur[out_pos] = static_cast<int64_t>(row);
                 mask_cur[out_pos] = true;
+                dist_cur[out_pos] = 0.0F;
+                pos_cur[out_pos] = static_cast<int64_t>(center_pos);
+            } else if (final_cur_rank[k - 1] < INF_RANK) {
+                out_cur[out_pos] = static_cast<int64_t>(final_cur_idx[k - 1]);
+                mask_cur[out_pos] = true;
+                dist_cur[out_pos] = final_cur_dist[k - 1];
+                pos_cur[out_pos] = static_cast<int64_t>(final_cur_rank[k - 1]);
             } else {
                 out_cur[out_pos] = 0;
                 mask_cur[out_pos] = false;
+                dist_cur[out_pos] = INF_DIST;
+                pos_cur[out_pos] = 0;
             }
+
             if (final_next_rank[k] < INF_RANK) {
                 out_next[out_pos] = static_cast<int64_t>(final_next_idx[k]);
                 mask_next[out_pos] = true;
+                dist_next[out_pos] = final_next_dist[k];
+                pos_next[out_pos] = static_cast<int64_t>(final_next_rank[k]);
             } else {
                 out_next[out_pos] = 0;
                 mask_next[out_pos] = false;
+                dist_next[out_pos] = INF_DIST;
+                pos_next[out_pos] = 0;
             }
         }
     }
@@ -287,6 +323,7 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
     const int64_t W64 = index_map.size(3);
     const int64_t O64 = window_offsets.size(0);
 
+    TORCH_CHECK(temporal_dilation == 1, "feature_topk_v25_cuda_ext is specialized for temporal_dilation=1");
     TORCH_CHECK(N64 <= std::numeric_limits<int>::max(), "N is too large for int32 kernel indexing");
     TORCH_CHECK(C64 <= std::numeric_limits<int>::max(), "C is too large for int32 kernel indexing");
     TORCH_CHECK(B64 <= std::numeric_limits<int>::max(), "B is too large for int32 kernel indexing");
@@ -294,7 +331,7 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
     TORCH_CHECK(H64 <= std::numeric_limits<int>::max(), "H is too large for int32 kernel indexing");
     TORCH_CHECK(W64 <= std::numeric_limits<int>::max(), "W is too large for int32 kernel indexing");
     TORCH_CHECK(O64 <= std::numeric_limits<int>::max(), "number of window offsets is too large for int32 kernel indexing");
-    TORCH_CHECK(topk <= std::numeric_limits<int>::max(), "topk is too large for int32 kernel indexing");
+    TORCH_CHECK(topk > 0 && topk <= std::numeric_limits<int>::max(), "topk must be a positive int32 value");
 
     const int N = static_cast<int>(N64);
     const int C = static_cast<int>(C64);
@@ -304,10 +341,10 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
     const int W = static_cast<int>(W64);
     const int O = static_cast<int>(O64);
     const int K = static_cast<int>(topk);
-    const int dt = static_cast<int>(temporal_dilation);
 
     auto long_opts = torch::TensorOptions().device(indices.device()).dtype(torch::kInt64);
     auto bool_opts = torch::TensorOptions().device(indices.device()).dtype(torch::kBool);
+    auto float_opts = torch::TensorOptions().device(indices.device()).dtype(torch::kFloat32);
 
     auto out_prev = torch::empty({N64, topk}, long_opts);
     auto out_cur = torch::empty({N64, topk}, long_opts);
@@ -315,9 +352,15 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
     auto mask_prev = torch::empty({N64, topk}, bool_opts);
     auto mask_cur = torch::empty({N64, topk}, bool_opts);
     auto mask_next = torch::empty({N64, topk}, bool_opts);
+    auto dist_prev = torch::empty({N64, topk}, float_opts);
+    auto dist_cur = torch::empty({N64, topk}, float_opts);
+    auto dist_next = torch::empty({N64, topk}, float_opts);
+    auto pos_prev = torch::empty({N64, topk}, long_opts);
+    auto pos_cur = torch::empty({N64, topk}, long_opts);
+    auto pos_next = torch::empty({N64, topk}, long_opts);
 
     if (N == 0) {
-        return {out_prev, out_cur, out_next, mask_prev, mask_cur, mask_next};
+        return {out_prev, out_cur, out_next, mask_prev, mask_cur, mask_next, dist_prev, dist_cur, dist_next, pos_prev, pos_cur, pos_next};
     }
 
     int threads = 128;
@@ -352,6 +395,12 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
             mask_prev.data_ptr<bool>(),
             mask_cur.data_ptr<bool>(),
             mask_next.data_ptr<bool>(),
+            dist_prev.data_ptr<float>(),
+            dist_cur.data_ptr<float>(),
+            dist_next.data_ptr<float>(),
+            pos_prev.data_ptr<int64_t>(),
+            pos_cur.data_ptr<int64_t>(),
+            pos_next.data_ptr<int64_t>(),
             N,
             C,
             B,
@@ -359,11 +408,10 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
             H,
             W,
             O,
-            dt,
             K
         );
     });
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {out_prev, out_cur, out_next, mask_prev, mask_cur, mask_next};
+    return {out_prev, out_cur, out_next, mask_prev, mask_cur, mask_next, dist_prev, dist_cur, dist_next, pos_prev, pos_cur, pos_next};
 }

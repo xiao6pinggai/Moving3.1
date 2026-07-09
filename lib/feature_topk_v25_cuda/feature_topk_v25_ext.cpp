@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <vector>
 
+constexpr int FEATURE_TOPK_V25_API_VERSION = 2;
+
 std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
     torch::Tensor indices,
     torch::Tensor index_map,
@@ -9,6 +11,10 @@ std::vector<torch::Tensor> feature_topk_v25_cuda_forward(
     int64_t temporal_dilation,
     int64_t topk
 );
+
+int api_version() {
+    return FEATURE_TOPK_V25_API_VERSION;
+}
 
 std::vector<torch::Tensor> forward(
     torch::Tensor indices,
@@ -33,7 +39,7 @@ std::vector<torch::Tensor> forward(
     TORCH_CHECK(features.dim() == 2 && features.size(0) == indices.size(0), "features must have shape [N, C]");
     TORCH_CHECK(window_offsets.dim() == 2 && window_offsets.size(1) == 2, "window_offsets must have shape [O, 2]");
     TORCH_CHECK(topk > 0, "topk must be > 0");
-    TORCH_CHECK(temporal_dilation > 0, "temporal_dilation must be > 0");
+    TORCH_CHECK(temporal_dilation == 1, "feature_topk_v25_cuda_ext is specialized for temporal_dilation=1");
 
     return feature_topk_v25_cuda_forward(
         indices.contiguous(),
@@ -46,5 +52,6 @@ std::vector<torch::Tensor> forward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("api_version", &api_version, "feature_topk_v25 CUDA extension API version");
     m.def("forward", &forward, "Feature-distance prev/current/next top-k forward CUDA for cosv25");
 }

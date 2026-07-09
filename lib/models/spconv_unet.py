@@ -30,6 +30,8 @@ from lib.models.cos_update_v22 import TripletMotionConsistencyMotionPairSparseCo
 from lib.models.cos_update_v23 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV23
 from lib.models.cos_update_v24 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV24
 from lib.models.cos_update_v25 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV25
+from lib.models.cos_update_v26 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV26
+from lib.models.cos_update_v27 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV27
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
@@ -46,6 +48,8 @@ MFE_MODULE_NAMES = (
     'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv',
     'cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv',
     'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv',
+    'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv',
+    'cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv',
 )
 BOTTLE_MFE_WITH_2_BLOCK = 'mfew2block'
 
@@ -146,11 +150,15 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         mfe_cls = TripletMotionConsistencyMotionPairSparseConvV24
     elif mfe_name in ('cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv'):
         mfe_cls = TripletMotionConsistencyMotionPairSparseConvV25
+    elif mfe_name in ('cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConvV26
+    elif mfe_name in ('cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv'):
+        mfe_cls = TripletMotionConsistencyMotionPairSparseConvV27
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
     if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
         kwargs['num_frames'] = int(opt.seqLen)
-    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv', 'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv', 'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv', 'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv', 'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv', 'cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv', 'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv'):
+    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv', 'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv', 'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv', 'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv', 'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv', 'cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv', 'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv', 'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv', 'cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv'):
         topk_values = parse_triplet_values(opt.tmc_topk, int, 'tmc_topk')
         window_values = parse_triplet_values(opt.tmc_window_size, int, 'tmc_window_size')
         idx = int(tmc_level) if tmc_level is not None else 0
@@ -159,10 +167,14 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         kwargs.setdefault('hidden_ratio', float(opt.tmc_hidden_ratio))
         kwargs.setdefault('pos_hidden', int(opt.tmc_pos_hidden))
         kwargs.setdefault('pos_scale', float(opt.tmc_pos_scale))
-        kwargs.setdefault('chunk_size', int(opt.tmc_chunk_size))
-        kwargs.setdefault('ffn_position', opt.tmc_ffn_position)
-        kwargs.setdefault('topk_relu', opt.topk_relu)
-        if mfe_name in ('cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv', 'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv'):
+        is_v25_or_v26 = mfe_name in ('cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv', 'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv')
+        is_v27 = mfe_name in ('cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv')
+        if not is_v25_or_v26:
+            kwargs.setdefault('chunk_size', int(opt.tmc_chunk_size))
+        if not is_v25_or_v26 and not is_v27:
+            kwargs.setdefault('ffn_position', opt.tmc_ffn_position)
+            kwargs.setdefault('topk_relu', opt.topk_relu)
+        if mfe_name in ('cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv', 'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv', 'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv'):
             kwargs.setdefault('tpdilation', opt.tpdilation)
         if mfe_name in ('cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv'):
             repeat_values = parse_triplet_values(opt.MFErepeat, int, 'MFErepeat')
