@@ -8,7 +8,7 @@ from lib.utils1.opts import opts
 import torch
 import os
 
-from lib.test_utils.test_0405 import test
+from lib.test_utils.test import test
 from lib.test_utils.test_update import test_update
 
 if __name__ == '__main__':

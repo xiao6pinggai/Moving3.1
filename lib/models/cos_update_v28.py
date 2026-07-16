@@ -7,19 +7,20 @@ feature_topk_v23_exact = None
 
 
 class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
-    """V27：精简版 V23 运动对注意力。
+    """V28：带单侧兜底和 garbage bin 的 V27 运动对注意力。
 
     输入是 spconv 稀疏张量，坐标格式沿用项目里的 [batch, time, y, x]，
     特征格式为 [N, C]。模块会对每个当前帧稀疏点分别寻找前一帧和后一帧
     的 K 个特征最近邻，形成 K x K 个 prev-cur-next 候选运动三元组。
 
-    注意力 key 不再使用 v23 里可选的 feature-key 分支，而是固定由坐标运动量
-    生成：当前点到前帧候选的位移、后帧候选到当前点的位移，以及二者差值
-    表示的加速度。这样保留了 v23 的运动一致性建模，同时让实验变量更干净。
+    注意力 key 使用前后两侧的 delta_xyt 和时空距离 dis 组成 8 维输入：
+    前帧候选到当前点的 [dy, dx, dt, dis]，以及当前点到后帧候选的
+    [dy, dx, dt, dis]。delta_xy 按空间窗口归一化，delta_t 按时间窗口归一化，
+    dis 按时空窗口对角线归一化。
 
-    本版本明确删除 v23 中已经关闭或兜底的路径：自注意力 SA、全局对齐、
-    Python fallback、旧权重兼容填充、未启用的非边缘化 value 聚合。主干路径
-    因此只包含 CUDA top-k、坐标运动注意力、三帧独立 value 投影、FFN 残差更新。
+    如果某一侧完全没有邻居点，该侧补一个自身点参与计算，其 delta_xyt/dis
+    自然为 0；不足 K 的占位点仍然作为非法点被 mask 掉。softmax 中额外加入
+    一条可学习 garbage 轨迹，归一化后丢弃该 bin，因此有效轨迹注意力和可以小于 1。
     """
 
     def __init__(
@@ -38,25 +39,21 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        # kernel_size 和 alpha 是早期 MFE 接口遗留参数，v27 不参与计算；
+        # kernel_size 和 alpha 是早期 MFE 接口遗留参数，v28 不参与计算；
         # 保留在函数签名中是为了兼容 build_mfe_module 的统一调用方式。
         del kernel_size, alpha
-        # 这些开关属于更早版本的注意力实现，v27 固定为坐标运动注意力。
+        # 这些开关属于更早版本的注意力实现，v28 固定为坐标运动注意力。
         for legacy_key in ("use_qkv", "use_maxpool", "use_biqkv"):
             kwargs.pop(legacy_key, None)
         if kwargs:
-            raise TypeError(f"Unexpected cosv27 kwargs: {sorted(kwargs)}")
+            raise TypeError(f"Unexpected cosv28 kwargs: {sorted(kwargs)}")
 
         # 基础超参数：C 是稀疏点特征维度，K 是每个时间方向保留的候选数。
         self.in_channels = int(in_channels)
-        self.head = 1
-        if self.in_channels % self.head != 0:
-            raise ValueError(f"cosv27 multi-head attention requires in_channels divisible by {self.head}, got {self.in_channels}")
-        self.head_dim = self.in_channels // self.head
         self.temporal_dilation = int(temporal_dilation)
         self.topk = int(topk)
         if self.topk <= 0:
-            raise ValueError("cosv27 requires tmc_topk > 0")
+            raise ValueError("cosv28 requires tmc_topk > 0")
 
         # 空间搜索窗口只用于 top-k 候选选择；坐标归一化尺度使用窗口半径，
         # 避免命令行 pos_scale 改动引入额外变量。
@@ -64,6 +61,8 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         self.window_radius = self.window_size // 2
         del pos_scale
         self.pos_scale = float(max(self.window_radius, 1))
+        self.time_scale = float(max(abs(self.temporal_dilation), 1))
+        self.spacetime_scale = float((2.0 * self.pos_scale * self.pos_scale + self.time_scale * self.time_scale) ** 0.5)
         self.chunk_size = int(chunk_size)
         self.conv = conv if conv is not None else nn.Identity()
         self.tao = 2.0  # 归一化权重的温度系数：固定在模块内部，不从命令行传入。
@@ -83,9 +82,9 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         self.next_proj = nn.Linear(in_channels, in_channels, bias=False)
         self.out_proj = nn.Linear(in_channels, in_channels, bias=False)
 
-        # 坐标运动 key：[当前-前帧，后帧-当前，加速度] -> C 维注意力 key。
+        # 坐标运动 key：[前侧 delta_yx/dis，后侧 delta_yx/dis] -> C 维注意力 key。
         self.traj_mlp = nn.Sequential(
-            nn.Linear(6, pos_hidden),
+            nn.Linear(8, pos_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(pos_hidden, in_channels),
         )
@@ -94,7 +93,8 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, in_channels),
         )
-        self.scale = self.head_dim ** -0.5
+        self.scale = in_channels ** -0.5
+        self.garbage_traj_key = nn.Parameter(torch.zeros(in_channels))
 
         # window_offsets 按离中心点的距离排序，CUDA top-k 会按这些偏移枚举窗口内候选。
         # 先访问近邻位置有利于稳定同距离候选的顺序。
@@ -150,14 +150,14 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
     def _get_index_map(self, x_conv, indices, index_map=None):
         """取得 CUDA int32 index_map；没有外部缓存时按当前稀疏坐标新建。
 
-        v27 明确不提供 CPU fallback，因此外部传入的 index_map 必须已经在 CUDA
+        v28 明确不提供 CPU fallback，因此外部传入的 index_map 必须已经在 CUDA
         上。dtype 允许自动转为 int32，以匹配 CUDA 扩展的输入约定。
         """
         if index_map is None:
             index_map = self._extract_external_index_map(x_conv)
         if index_map is not None:
             if not index_map.is_cuda:
-                raise RuntimeError("cosv27 requires CUDA index_map; no CPU fallback is available")
+                raise RuntimeError("cosv28 requires CUDA index_map; no CPU fallback is available")
             if index_map.dtype != torch.int32:
                 index_map = index_map.to(dtype=torch.int32)
             return index_map.contiguous()
@@ -173,7 +173,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         """
         if x_conv.features.shape != input_features.shape or x_conv.features.shape[1] != in_channels:
             raise RuntimeError(
-                "cosv27 requires conv to preserve sparse point count, order, and channels; "
+                "cosv28 requires conv to preserve sparse point count, order, and channels; "
                 f"got input features {tuple(input_features.shape)} and conv features {tuple(x_conv.features.shape)}"
             )
 
@@ -191,7 +191,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
     def _load_cuda_topk(self):
         """延迟加载 v23 的 CUDA top-k 扩展。
 
-        v27 沿用 v23 的前后帧候选搜索 kernel：输入当前点特征和窗口索引，
+        v28 沿用 v23 的前后帧候选搜索 kernel：输入当前点特征和窗口索引，
         输出每个点在前一帧、后一帧的 top-k 候选行号及有效 mask。
         """
         global feature_topk_v23_exact
@@ -207,7 +207,7 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         pair_mask 屏蔽掉，不参与注意力。
         """
         if not indices.is_cuda or not features_norm.is_cuda:
-            raise RuntimeError("cosv27 Top-K requires CUDA indices and features; no Python fallback is available")
+            raise RuntimeError("cosv28 Top-K requires CUDA indices and features; no Python fallback is available")
         return self._load_cuda_topk()(
             indices=indices,
             index_map=index_map,
@@ -217,20 +217,34 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             topk=self.topk,
         )
 
-    def _masked_temperature_softmax(self, logits, mask):
-        """带 mask 和温度系数的归一化。
+    @staticmethod
+    def _inject_self_for_missing_side(idx_side, mask_side, row_ids):
+        """某一侧完全无邻居时，补一个自身点；不足 K 的其它位置继续非法。"""
+        missing = ~mask_side.any(dim=1)
+        if not missing.any():
+            return idx_side, mask_side
+        idx_side = idx_side.clone()
+        mask_side = mask_side.clone()
+        idx_side[missing] = row_ids[missing].view(-1, 1).expand(-1, idx_side.shape[1])
+        mask_side[missing] = False
+        idx_side[missing, 0] = row_ids[missing]
+        mask_side[missing, 0] = True
+        return idx_side, mask_side
 
-        logits 形状通常是 [有效点数, K*K]。先把无效轨迹填为极小值，再除以
-        self.tao 做温度缩放；最后二次乘 mask 并重新归一化，避免所有无效位置
-        的数值残留影响边缘化权重。
+    def _masked_temperature_softmax_with_bin(self, logits, mask, q_flat):
+        """一次 softmax：真实轨迹和可学习 garbage 轨迹共同竞争。
+
+        q_flat 形状为 [Bv, C]。garbage_traj_key 是一条可学习 key，
+        其 logit 同样由 q dot key 产生；softmax 后丢弃该 bin，不再重新归一化。
         """
         logits = logits.masked_fill(~mask, -1e4)
-        attn = torch.softmax(logits / self.tao, dim=-1)
-        attn = attn * mask.to(attn.dtype)
-        return attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        bin_key = self.garbage_traj_key.to(dtype=q_flat.dtype, device=q_flat.device).view(1, -1)
+        bin_logit = (q_flat * bin_key).sum(dim=-1, keepdim=True) * self.scale
+        attn_with_bin = torch.softmax(torch.cat([logits, bin_logit], dim=-1) / self.tao, dim=-1)
+        return attn_with_bin[:, :-1] * mask.to(attn_with_bin.dtype)
 
     def forward(self, x, index_map=None):
-        """执行一次 v27 运动一致性特征增强。
+        """执行一次 v28 运动一致性特征增强。
 
         返回 output_features 和 score：output_features 与输入 features 同形状 [N, C]；
         score 是每个点最大轨迹注意力，形状 [N, 1]，主要用于沿用 MFE 接口或调试
@@ -240,16 +254,16 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
         if input_features.numel() == 0:
             return input_features, input_features.new_zeros((input_features.shape[0], 1))
         if not input_features.is_cuda:
-            raise RuntimeError("cosv27 requires CUDA sparse features; no CPU fallback is available")
+            raise RuntimeError("cosv28 requires CUDA sparse features; no CPU fallback is available")
 
-        # 先执行传入的局部卷积分支。v27 后续按稀疏点行号写回结果，
+        # 先执行传入的局部卷积分支。v28 后续按稀疏点行号写回结果，
         # 因此这里要求 conv 不改变点数、顺序和通道数。
         x_conv = self.conv(x)
         self._check_conv_contract(input_features, x_conv, self.in_channels)
         indices = x_conv.indices
         features = x_conv.features
         if not indices.is_cuda or not features.is_cuda:
-            raise RuntimeError("cosv27 requires CUDA indices and features; no Python fallback is available")
+            raise RuntimeError("cosv28 requires CUDA indices and features; no Python fallback is available")
 
         n_points, channels = features.shape
         k = self.topk
@@ -264,16 +278,17 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             dense_index_map,
         )
 
-        # 只有同时存在前帧和后帧候选点的当前点，才能构成完整的 prev-cur-next 轨迹。
-        has_pair = mask_prev.any(dim=1) & mask_next.any(dim=1)
-        valid_idx = has_pair.nonzero(as_tuple=False).squeeze(1)
+        # 单侧完全无邻居时补一个自身点；这样所有当前点都能进入注意力计算。
+        all_rows = torch.arange(n_points, device=indices.device, dtype=idx_prev.dtype)
+        idx_prev, mask_prev = self._inject_self_for_missing_side(idx_prev, mask_prev, all_rows)
+        idx_next, mask_next = self._inject_self_for_missing_side(idx_next, mask_next, all_rows)
+        valid_idx = all_rows.to(dtype=torch.long)
         update = input_features.new_zeros(n_points, channels)
         score = features.new_zeros(n_points, 1)
-        if valid_idx.numel() == 0:
-            return input_features, score
 
-        # 只取空间坐标 y/x 参与运动建模，时间方向已经由 prev/next 搜索确定。
+        # 空间坐标和时间坐标一起构造 delta_xyt/dis。
         spatial = indices[:, 2:4].to(features.dtype)
+        times = indices[:, 1:2].to(features.dtype)
         pair_chunk = self._adaptive_chunk_size(valid_idx.numel(), k * k, channels, pair_factor=1)
         for start in range(0, valid_idx.numel(), pair_chunk):
             end = min(start + pair_chunk, valid_idx.numel())
@@ -293,49 +308,69 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             f_prev = features_norm[idx_prev_v.reshape(-1)].view(n_valid, k, channels)
             f_next = features_norm[idx_next_v.reshape(-1)].view(n_valid, k, channels)
 
-            # q: [Bv, H, 1, 1, Dh]，每个 head 独立匹配 K x K 条候选轨迹。
-            head = self.head
-            head_dim = self.head_dim
-            q = self.q_proj(f_cur).view(n_valid, head, 1, 1, head_dim)
-            cur_value = self.cur_proj(f_cur).view(n_valid, head, head_dim)
-            prev_value = self.prev_proj(f_prev).view(n_valid, k, head, head_dim).permute(0, 2, 1, 3).contiguous()
-            next_value = self.next_proj(f_next).view(n_valid, k, head, head_dim).permute(0, 2, 1, 3).contiguous()
+            # q: [Bv, 1, 1, C]，通过广播同时匹配 K x K 条候选轨迹。
+            q = self.q_proj(f_cur).view(n_valid, 1, 1, channels)
+            cur_value = self.cur_proj(f_cur)
+            prev_value = self.prev_proj(f_prev)
+            next_value = self.next_proj(f_next)
 
-            # 使用 y/x 坐标构造轨迹几何量。
+            # 使用 y/x/t 坐标构造前后两侧的 [dy, dx, dt, dis]。
             s_cur = spatial[rows].view(n_valid, 1, 1, 2)
             s_prev = spatial[idx_prev_v].view(n_valid, k, 1, 2)
             s_next = spatial[idx_next_v].view(n_valid, 1, k, 2)
-            # d_minus 表示从前帧候选到当前点的位移，d_plus 表示从当前点到后帧候选的位移。
-            # accel 越小，说明前后两段运动越接近匀速直线运动。
-            d_minus = s_cur - s_prev
-            d_plus = s_next - s_cur
-            accel = d_plus - d_minus
-            motion_input = torch.cat(
+            t_cur = times[rows].view(n_valid, 1, 1, 1)
+            t_prev = times[idx_prev_v].view(n_valid, k, 1, 1)
+            t_next = times[idx_next_v].view(n_valid, 1, k, 1)
+
+            dxy_prev = s_cur - s_prev
+            dt_prev = t_cur - t_prev
+            dis_prev = torch.sqrt(dxy_prev.square().sum(dim=-1, keepdim=True) + dt_prev.square())
+            prev_input = torch.cat(
                 [
-                    d_minus.expand(-1, -1, k, -1),
-                    d_plus.expand(-1, k, -1, -1),
-                    accel,
+                    dxy_prev / max(self.pos_scale, 1e-6),
+                    dt_prev / max(self.time_scale, 1e-6),
+                    dis_prev / max(self.spacetime_scale, 1e-6),
                 ],
                 dim=-1,
             )
-            # 归一化坐标量，避免窗口尺寸变化直接放大 MLP 输入尺度。
-            motion_input = motion_input / max(self.pos_scale, 1e-6)
 
-            # 每条轨迹生成一个 C 维 key，再拆为 H 个 head 与当前点 q 做点积。
-            traj_key = self.traj_mlp(motion_input.reshape(-1, 6)).view(n_valid, k, k, head, head_dim)
-            traj_key = traj_key.permute(0, 3, 1, 2, 4).contiguous()
+            dxy_next = s_next - s_cur
+            dt_next = t_next - t_cur
+            dis_next = torch.sqrt(dxy_next.square().sum(dim=-1, keepdim=True) + dt_next.square())
+            next_input = torch.cat(
+                [
+                    dxy_next / max(self.pos_scale, 1e-6),
+                    dt_next / max(self.time_scale, 1e-6),
+                    dis_next / max(self.spacetime_scale, 1e-6),
+                ],
+                dim=-1,
+            )
+            motion_input = torch.cat(
+                [
+                    prev_input.expand(-1, -1, k, -1),
+                    next_input.expand(-1, k, -1, -1),
+                ],
+                dim=-1,
+            )
+
+            # 每条轨迹生成一个 C 维 key，再与当前点 q 做点积得到轨迹分数。
+            traj_key = self.traj_mlp(motion_input.reshape(-1, 8)).view(n_valid, k, k, channels)
             logits = (q * traj_key).sum(dim=-1) * self.scale
-            # 每个 head 独立在 K x K 条轨迹上归一化，self.tao 控制分布尖锐程度。
-            attn = self._masked_temperature_softmax(logits.view(n_valid, head, k * k), pair_mask.view(n_valid, 1, k * k))
-            attn = attn.view(n_valid, head, k, k)
+            # 在 K x K 条真实轨迹和一条 garbage 轨迹上做一次 softmax，随后丢弃 bin。
+            attn = self._masked_temperature_softmax_with_bin(
+                logits.view(n_valid, k * k),
+                pair_mask.view(n_valid, k * k),
+                q.view(n_valid, channels),
+            )
+            attn = attn.view(n_valid, k, k)
 
             # 将 K x K 轨迹注意力边缘化为前帧权重和后帧权重，使 value 聚合保持 O(K)。
-            w_prev = attn.sum(dim=3)
-            w_next = attn.sum(dim=2)
-            h_prev = (w_prev.unsqueeze(-1) * prev_value).sum(dim=2)
-            h_next = (w_next.unsqueeze(-1) * next_value).sum(dim=2)
-            # 当前点 value 加上前后帧上下文，再拼回 C 维得到本次注意力消息。
-            value = (cur_value + h_prev + h_next).reshape(n_valid, channels)
+            w_prev = attn.sum(dim=2)
+            w_next = attn.sum(dim=1)
+            h_prev = (w_prev.unsqueeze(-1) * prev_value).sum(dim=1)
+            h_next = (w_next.unsqueeze(-1) * next_value).sum(dim=1)
+            # 当前点 value 加上前后帧上下文，得到本次注意力的消息。
+            value = cur_value + h_prev + h_next
 
             # 标准残差结构：注意力消息先残差加回当前点，再经过 FFN 残差细化。
             attn_update = self.out_proj(value)
@@ -344,9 +379,9 @@ class TripletMotionConsistencyMotionPairSparseConv(nn.Module):
             # update 只记录增量，循环结束后统一加回 input_features，便于未命中轨迹的点保持原样。
             # score 使用最大轨迹权重，数值越大表示该点的最可信运动三元组越集中。
             update[rows] = out_v - f_cur_res
-            score[rows] = attn.amax(dim=(1, 2, 3), keepdim=False).unsqueeze(1)
+            score[rows] = attn.amax(dim=(1, 2), keepdim=False).unsqueeze(1)
 
         return input_features + update, score
 
 
-TripletMotionConsistencyMotionPairSparseConvV27 = TripletMotionConsistencyMotionPairSparseConv
+TripletMotionConsistencyMotionPairSparseConvV28 = TripletMotionConsistencyMotionPairSparseConv

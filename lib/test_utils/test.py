@@ -46,7 +46,7 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
     model.eval()
 
 
-    return_time = False
+    return_time = True
     # num_classes = dataset.num_classes
     num_classes = DataVal.num_classes
     max_per_image = opt.K
@@ -110,6 +110,7 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
     results = {}
     his_img_num =0
     results_return = {} # 写txt结果
+    component_stats = {}
     image_id_map = None
     if save_json and hasattr(DataVal, 'coco'):
         image_id_map = {}
@@ -173,7 +174,7 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
                         continue
                     input_batch[k] = torch.from_numpy(input_batch[k]).to(opt.device)
                 time_start1 = time.time() # 放在这里不合理
-                output, dets = process(model, input_batch, return_time, opt, opt.K) # output==z
+                output, dets, forward_time = process(model, input_batch, return_time, opt, opt.K) # output==z
                 # ── 捕获特征图并保存（每段视频前 vis_max_frames 张）─────────
                 if vis_features:
                     vis_mgr.save_batch(patch_ims)
@@ -198,7 +199,8 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
                 # 计算指标用NMS以后的
 
                 time_end = time.time()
-                time_all.append(time_end - time_start1)
+                forward_elapsed = forward_time - time_start1
+                time_all.append(forward_elapsed)
                 preprocess_time_all.append((time_start1 - time_start0))
                 if save_json:
                     for im_id_i, ret in enumerate(rets):
@@ -319,14 +321,49 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
             if vis_features:
                 vis_mgr.remove()
             # break
+        if hasattr(model, 'print_dataset_stage1_summary'):
+            model.print_dataset_stage1_summary()
         time_mean = np.array(time_all).mean()
         time_preprocess_mean = np.array(preprocess_time_all).mean()
-        print('total_time_mean:', time_mean/patch_len, 'frames per second: ', 1/time_mean*patch_len)
+        print('forward_time_mean:', time_mean/patch_len, 'forward frames per second: ', 1/time_mean*patch_len)
         print('time_preprocess_mean:', time_preprocess_mean / patch_len, 'frames per second: ', 1 / time_preprocess_mean * patch_len)
         results_return['total_time_mean'] = time_mean/patch_len
         results_return['frames_per_second'] = 1/time_mean*patch_len
+        results_return['forward_time_mean'] = time_mean/patch_len
+        results_return['forward_frames_per_second'] = 1/time_mean*patch_len
         results_return['total_preprocess_time_mean'] = time_preprocess_mean/patch_len
         results_return['preprocess_frames_per_second'] = 1/time_preprocess_mean*patch_len
+        if hasattr(model, 'get_component_stats'):
+            component_stats = model.get_component_stats(per_frame_divisor=patch_len)
+            if component_stats:
+                print('===== Five-Stage Component Profiling =====')
+                print('Stage                 runtime(s)  runtime(%)  Params      GFLOPS')
+                component_order = getattr(model, 'runtime_component_names', ())
+                for component_name in component_order:
+                    stats_dict = component_stats[component_name]
+                    display_name = stats_dict.get('display_name', component_name)
+                    print(
+                        f"{display_name:<20} {stats_dict['runtime']:.6f}    "
+                        f"{stats_dict['runtime_percent']:>7.2f}%  {stats_dict['params']:<10d} {stats_dict['gflops']:.6f}"
+                    )
+                    key_prefix = display_name.replace(' ', '_').replace('/', '_').replace('.', '').replace('%', 'pct')
+                    results_return[f'{key_prefix}_runtime_mean'] = stats_dict['runtime']
+                    results_return[f'{key_prefix}_runtime_percent'] = stats_dict['runtime_percent']
+                    results_return[f'{key_prefix}_params'] = stats_dict['params']
+                    results_return[f'{key_prefix}_GFLOPS'] = stats_dict['gflops']
+                total_stats = component_stats.get('Total')
+                if total_stats is not None:
+                    print(
+                        f"{'Total':<20} {total_stats['runtime']:.6f}    "
+                        f"{total_stats['runtime_percent']:>7.2f}%  {total_stats['params']:<10d} {total_stats['gflops']:.6f}"
+                    )
+                    results_return['Total_runtime_mean'] = total_stats['runtime']
+                    results_return['Total_runtime_percent'] = total_stats['runtime_percent']
+                    results_return['Total_params'] = total_stats['params']
+                    results_return['Total_GFLOPS'] = total_stats['gflops']
+                print('=========================================')
+                if hasattr(model, '_component_profile_printed'):
+                    model._component_profile_printed = True
         if False:
             # 循环结束后计算平均
             average_sampling_rate = total_sampling_rate / num_batches
@@ -379,8 +416,27 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
             results_tol_txt_fid.close()
             time_txt = open(os.path.join(opt.save_results_dir, results_name, 'time.txt'),'w')
             if inference:
-                time_txt.write('total_time_mean: %.4f\t frames per second: %.2f\n'%(time_mean/patch_len, 1/time_mean*patch_len))
+                time_txt.write('forward_time_mean: %.4f\t forward frames per second: %.2f\n'%(time_mean/patch_len, 1/time_mean*patch_len))
                 time_txt.write('total_preprocess_time_mean: %.4f\t preprocess frames per second: %.2f\n'%(time_preprocess_mean/patch_len, 1/time_preprocess_mean*patch_len))
+                if component_stats:
+                    time_txt.write('===== Five-Stage Component Profiling =====\n')
+                    component_order = getattr(model, 'runtime_component_names', ())
+                    for component_name in component_order:
+                        stats_dict = component_stats[component_name]
+                        display_name = stats_dict.get('display_name', component_name)
+                        time_txt.write(
+                            f"{display_name}: runtime={stats_dict['runtime']:.6f}s, "
+                            f"runtime_percent={stats_dict['runtime_percent']:.2f}%, "
+                            f"Params={stats_dict['params']}, GFLOPS={stats_dict['gflops']:.6f}\n"
+                        )
+                    total_stats = component_stats.get('Total')
+                    if total_stats is not None:
+                        time_txt.write(
+                            f"Total: runtime={total_stats['runtime']:.6f}s, "
+                            f"runtime_percent={total_stats['runtime_percent']:.2f}%, "
+                            f"Params={total_stats['params']}, GFLOPS={total_stats['gflops']:.6f}\n"
+                        )
+                    time_txt.write('=========================================\n')
             time_txt.close()
         del model, conf_results
         gc.collect()

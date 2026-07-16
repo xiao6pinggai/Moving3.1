@@ -153,7 +153,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
         # 动态阈值：均值 + 系数 * 标准差
         dynamic_thresh = mask_mean + var_coeff * mask_std
-
+        # dynamic_thresh = 0.5
         # 初始二值掩码 [B, 1, T, H, W]
         binary_mask = (soft_mask > dynamic_thresh).float()
 

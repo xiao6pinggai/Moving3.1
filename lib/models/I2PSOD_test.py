@@ -32,7 +32,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
                  net1name='UNet3DWithNormalConv3D', opt=None):
         super().__init__()
         self.print = 0
-        self.use_runtime = getattr(opt, 'use_runtime', False)
+        self.use_runtime = getattr(opt, 'use_runtime', True)
         self.runtime_component_names = (
             'I2PNet',
             'ACS',
@@ -40,6 +40,14 @@ class Img2PointsSmallObjectDetection(nn.Module):
             'MFE',
             'DetHead',
         )
+        self.component_display_names = {
+            'I2PNet': 'SRC w/o ACS',
+            'ACS': 'ACS',
+            'BackboneNoMFE': 'GCC w/o TAA',
+            'MFE': 'TAA',
+            'DetHead': 'Det. Head',
+            'Total': 'Total',
+        }
         self._mfe_module_prefixes = (
             'shortcut1',
             'shortcut2',
@@ -72,6 +80,12 @@ class Img2PointsSmallObjectDetection(nn.Module):
         self._stat_fa_sum       = 0.0   # 各帧虚警率之和
         self._stat_fa_cnt       = 0     # 帧总数
         self._stat_batch_idx    = 0     # 已处理 batch 数
+        # SR/GFLOPS：按 batch 统计，GFLOPS 按图像帧平均（除以 B*T）
+        self._stat_sr_sum       = 0.0
+        self._stat_sr_cnt       = 0
+        self._stat_stage1_gflops_sum = 0.0
+        self._stat_total_gflops_sum  = 0.0
+        self._stat_gflops_cnt        = 0
         # ==================================================
         # points generate net
         self.net1name=net1name
@@ -164,13 +178,13 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
             self.sigmoid = nn.Sigmoid()
 
-            self.tau = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True)
-            self.tau.data.fill_(1)
-            self.conv_std = nn.Sequential(
-                nn.AdaptiveAvgPool2d([1, 1]),
-                nn.Conv2d(img_num, img_num, 1),
-                nn.ReLU(inplace=True)
-            )
+            # self.tau = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True)
+            # self.tau.data.fill_(1)
+            # self.conv_std = nn.Sequential(
+            #     nn.AdaptiveAvgPool2d([1, 1]),
+            #     nn.Conv2d(img_num, img_num, 1),
+            #     nn.ReLU(inplace=True)
+            # )
 
             self.relu = nn.ReLU(inplace=True)
     '''
@@ -266,9 +280,10 @@ class Img2PointsSmallObjectDetection(nn.Module):
     # 第一阶段检测质量指标（仅非训练阶段调用）
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _compute_and_print_stage1_metrics(self, binary_mask, bboxes, b, t, h, w, device):
+    def _compute_and_print_stage1_metrics(self, binary_mask, bboxes, b, t, h, w, device,
+                                          sampling_rate=None, flops_dict=None):
         """
-        计算并实时打印三项指标，同时累计数据集总平均。
+        计算并实时打印第一阶段质量、采样率和计算量指标，同时累计数据集总平均。
 
         参数
         ----
@@ -289,6 +304,11 @@ class Img2PointsSmallObjectDetection(nn.Module):
         3. 点级虚警率（false_alarm_rate）—— 点级
              对每帧计算：采样点中落在所有真值框**外**的点数 / 全图像素数（H×W）
              取所有帧的平均值作为当前 batch 的指标。
+
+        4. 采样率（SR）—— 当前 batch 的采样点数 / B×T×H×W。
+
+        5. 平均计算量（GFLOPS）—— hook 估算 FLOPs / 1e9 / (B×T)。
+             Stage1 包含 I2PNet + ACS；Total 包含模型已分类组件之和。
         """
         # ---- 准备 binary_mask：压缩通道维度 → [B, T, H, W] ----
         bm = binary_mask.squeeze(1)   # [B, T, H, W]  float 0/1
@@ -372,16 +392,64 @@ class Img2PointsSmallObjectDetection(nn.Module):
         self._stat_fa_cnt      += batch_fa_cnt
         self._stat_batch_idx   += 1
 
+        # ---- SR / GFLOPS 累计 ----
+        cur_sr = None
+        if sampling_rate is not None:
+            cur_sr = float(sampling_rate)
+            self._stat_sr_sum += cur_sr
+            self._stat_sr_cnt += 1
+
+        cur_stage1_gflops = None
+        cur_total_gflops = None
+        if flops_dict is not None:
+            frame_divisor = max(float(b * t), 1.0)
+            stage1_flops = float(flops_dict.get('I2PNet', 0.0)) + float(flops_dict.get('ACS', 0.0))
+            total_flops = sum(float(flops_dict.get(name, 0.0)) for name in self.runtime_component_names)
+            cur_stage1_gflops = stage1_flops / 1e9 / frame_divisor
+            cur_total_gflops = total_flops / 1e9 / frame_divisor
+            self._stat_stage1_gflops_sum += cur_stage1_gflops
+            self._stat_total_gflops_sum += cur_total_gflops
+            self._stat_gflops_cnt += 1
+
         # ---- 数据集累计均值 ----
         ds_recall = self._stat_recall_sum / self._stat_recall_cnt if self._stat_recall_cnt > 0 else 0.0
         ds_hit    = self._stat_hit_num    / self._stat_hit_den    if self._stat_hit_den    > 0 else 0.0
         ds_fa     = self._stat_fa_sum     / self._stat_fa_cnt     if self._stat_fa_cnt     > 0 else 0.0
+        ds_sr     = self._stat_sr_sum     / self._stat_sr_cnt     if self._stat_sr_cnt     > 0 else None
+        ds_stage1_gflops = (
+            self._stat_stage1_gflops_sum / self._stat_gflops_cnt
+            if self._stat_gflops_cnt > 0 else None
+        )
+        ds_total_gflops = (
+            self._stat_total_gflops_sum / self._stat_gflops_cnt
+            if self._stat_gflops_cnt > 0 else None
+        )
+
+        cur_profile = ""
+        if cur_sr is not None:
+            cur_profile += f"  SR={cur_sr*100:.4f}%"
+        if cur_stage1_gflops is not None:
+            cur_profile += (
+                f"  Stage1_GFLOPS={cur_stage1_gflops:.6f}"
+                f"  Total_GFLOPS={cur_total_gflops:.6f}"
+            )
+
+        ds_profile = ""
+        if ds_sr is not None:
+            ds_profile += f"  SR={ds_sr*100:.4f}%"
+        if ds_stage1_gflops is not None:
+            ds_profile += (
+                f"  Stage1_GFLOPS={ds_stage1_gflops:.6f}"
+                f"  Total_GFLOPS={ds_total_gflops:.6f}"
+            )
 
         # ---- 打印 ----
         print(
             f"[Stage1 Metrics] Batch {self._stat_batch_idx:04d} | "
-            f"当前: 命中率={cur_hit*100:.2f}%  命中覆盖率={cur_recall*100:.2f}%  虚警率={cur_fa*100:.4f}% | "
-            f"数据集累计: 命中率={ds_hit*100:.2f}%  命中覆盖率={ds_recall*100:.2f}%  虚警率={ds_fa*100:.4f}%"
+            f"当前: 命中率={cur_hit*100:.2f}%  命中覆盖率={cur_recall*100:.2f}%  "
+            f"虚警率={cur_fa*100:.4f}%{cur_profile} | "
+            f"数据集累计: 命中率={ds_hit*100:.2f}%  命中覆盖率={ds_recall*100:.2f}%  "
+            f"虚警率={ds_fa*100:.4f}%{ds_profile}"
         )
 
     def print_dataset_stage1_summary(self):
@@ -389,12 +457,26 @@ class Img2PointsSmallObjectDetection(nn.Module):
         ds_recall = self._stat_recall_sum / self._stat_recall_cnt if self._stat_recall_cnt > 0 else 0.0
         ds_hit    = self._stat_hit_num    / self._stat_hit_den    if self._stat_hit_den    > 0 else 0.0
         ds_fa     = self._stat_fa_sum     / self._stat_fa_cnt     if self._stat_fa_cnt     > 0 else 0.0
+        ds_sr     = self._stat_sr_sum     / self._stat_sr_cnt     if self._stat_sr_cnt     > 0 else None
+        ds_stage1_gflops = (
+            self._stat_stage1_gflops_sum / self._stat_gflops_cnt
+            if self._stat_gflops_cnt > 0 else None
+        )
+        ds_total_gflops = (
+            self._stat_total_gflops_sum / self._stat_gflops_cnt
+            if self._stat_gflops_cnt > 0 else None
+        )
         print("=" * 80)
         print(f"[Stage1 Dataset Summary]  共处理 {self._stat_batch_idx} 个 batch，"
               f"有效框 {self._stat_hit_den} 个，帧 {self._stat_fa_cnt} 帧")
         print(f"  第一阶段命中率（hit_rate）        : {ds_hit*100:.4f}%")
         print(f"  第一阶段命中覆盖率（coverage_rate）: {ds_recall*100:.4f}%")
         print(f"  点级虚警率（false_alarm）         : {ds_fa*100:.6f}%")
+        if ds_sr is not None:
+            print(f"  采样率（SR）                      : {ds_sr*100:.6f}%")
+        if ds_stage1_gflops is not None:
+            print(f"  第一阶段平均计算量（Stage1 GFLOPS）: {ds_stage1_gflops:.6f}")
+            print(f"  模型总平均计算量（Total GFLOPS）   : {ds_total_gflops:.6f}")
         print("=" * 80)
     # ------------------------------------------------------------------
 
@@ -422,21 +504,38 @@ class Img2PointsSmallObjectDetection(nn.Module):
             for name in self.runtime_component_names
         }
 
+    def get_component_display_name(self, component_name):
+        return self.component_display_names.get(component_name, component_name)
+
     def get_component_stats(self, per_frame_divisor=1):
         runtime_stats = self.get_runtime_stats(per_frame_divisor=per_frame_divisor)
         flops_stats = self.get_flops_stats(per_frame_divisor=per_frame_divisor)
         param_stats = self.get_component_param_stats()
         stats = {}
+        total_runtime = sum(float(runtime_stats.get(name, 0.0)) for name in self.runtime_component_names)
+        total_flops = sum(float(flops_stats.get(name, 0.0)) for name in self.runtime_component_names)
+        total_params = self.get_total_param_count()
         for name in self.runtime_component_names:
+            runtime = float(runtime_stats.get(name, 0.0))
+            flops = float(flops_stats.get(name, 0.0))
+            params = int(param_stats.get(name, 0))
             stats[name] = {
-                'runtime': float(runtime_stats.get(name, 0.0)),
-                'flops': float(flops_stats.get(name, 0.0)),
-                'params': int(param_stats.get(name, 0)),
+                'display_name': self.get_component_display_name(name),
+                'runtime': runtime,
+                'runtime_percent': runtime / total_runtime * 100.0 if total_runtime > 0 else 0.0,
+                'flops': flops,
+                'gflops': flops / 1e9,
+                'params': params,
+                'params_percent': params / total_params * 100.0 if total_params > 0 else 0.0,
             }
         stats['Total'] = {
-            'runtime': sum(stats[name]['runtime'] for name in self.runtime_component_names),
-            'flops': sum(stats[name]['flops'] for name in self.runtime_component_names),
-            'params': self.get_total_param_count(),
+            'display_name': self.get_component_display_name('Total'),
+            'runtime': total_runtime,
+            'runtime_percent': 100.0 if total_runtime > 0 else 0.0,
+            'flops': total_flops,
+            'gflops': total_flops / 1e9,
+            'params': total_params,
+            'params_percent': 100.0 if total_params > 0 else 0.0,
         }
         return stats
 
@@ -447,17 +546,18 @@ class Img2PointsSmallObjectDetection(nn.Module):
             per_frame_divisor = self._runtime_frame_divisor
         stats = self.get_component_stats(per_frame_divisor=per_frame_divisor)
         print('=' * 80)
-        print('[Component Profiling Summary]')
+        print('[Five-Stage Component Profiling Summary]')
+        print('  Stage                 runtime(s)  runtime(%)  Params      GFLOPS')
         for component_name in self.runtime_component_names:
             item = stats[component_name]
             print(
-                f"  {component_name}: runtime={item['runtime']:.6f}s  "
-                f"FLOPs={item['flops']:.6f}  Params={item['params']}"
+                f"  {item['display_name']:<20} {item['runtime']:.6f}    "
+                f"{item['runtime_percent']:>7.2f}%  {item['params']:<10d} {item['gflops']:.6f}"
             )
         total = stats['Total']
         print(
-            f"  Total: runtime={total['runtime']:.6f}s  "
-            f"FLOPs={total['flops']:.6f}  Params={total['params']}"
+            f"  {total['display_name']:<20} {total['runtime']:.6f}    "
+            f"{total['runtime_percent']:>7.2f}%  {total['params']:<10d} {total['gflops']:.6f}"
         )
         if self._unclassified_param_count:
             print(f"  UnclassifiedParams: {self._unclassified_param_count}")
@@ -480,8 +580,8 @@ class Img2PointsSmallObjectDetection(nn.Module):
     def _runtime_enabled(self):
         return self.use_runtime and (not self.training)
 
-    def _flops_enabled(self):
-        return self.use_runtime and (not self.training)
+    def _flops_enabled(self, force=False):
+        return (self.use_runtime or force) and (not self.training)
 
     def _is_mfe_local_name(self, local_name):
         for prefix in self._mfe_module_prefixes:
@@ -546,6 +646,47 @@ class Img2PointsSmallObjectDetection(nn.Module):
         self._sync_device(device)
         return time.perf_counter() - start_time
 
+    def _is_top_level_mfe_runtime_module(self, module_name):
+        if not module_name.startswith('sp_backbone.'):
+            return False
+        local_name = module_name[len('sp_backbone.'):]
+        if '.' in local_name:
+            return False
+        return local_name in (
+            'shortcut1', 'shortcut2', 'shortcut3',
+            'shortcut1fusion', 'shortcut2fusion', 'shortcut3fusion',
+        )
+
+    def _start_mfe_runtime_capture(self, device):
+        if not self._runtime_enabled():
+            return None, None
+        meter = {'MFE': 0.0}
+        handles = []
+
+        def _pre_hook(module, inputs):
+            module._codex_runtime_start = self._runtime_start(device)
+
+        def _post_hook(module, inputs, output):
+            start_time = getattr(module, '_codex_runtime_start', None)
+            if start_time is None:
+                return
+            meter['MFE'] += self._runtime_stop(start_time, device)
+            module._codex_runtime_start = None
+
+        for module_name, module in self.named_modules():
+            if not self._is_top_level_mfe_runtime_module(module_name):
+                continue
+            handles.append(module.register_forward_pre_hook(_pre_hook))
+            handles.append(module.register_forward_hook(_post_hook))
+        return meter, handles
+
+    @staticmethod
+    def _stop_runtime_capture(handles):
+        if handles is None:
+            return
+        for handle in handles:
+            handle.remove()
+
     def _new_runtime_dict(self):
         return {name: 0.0 for name in self.runtime_component_names}
 
@@ -576,8 +717,8 @@ class Img2PointsSmallObjectDetection(nn.Module):
     def _estimate_module_flops(self, module, inputs, output):
         return estimate_module_flops(module, inputs, output)
 
-    def _start_flops_capture(self):
-        if not self._flops_enabled():
+    def _start_flops_capture(self, force=False):
+        if not self._flops_enabled(force=force):
             return None, None
         flops_dict = self._new_runtime_dict()
         handles = []
@@ -587,8 +728,25 @@ class Img2PointsSmallObjectDetection(nn.Module):
                 flops_dict[component_name] += self._estimate_module_flops(module, inputs, output)
             return _hook
 
+        attention_prefixes = []
+        for module_name, module in self.named_modules():
+            class_name = module.__class__.__name__
+            if "SparseSymmetricCosineAttention" in class_name or "TripletMotionConsistency" in class_name:
+                attention_prefixes.append(module_name)
+
+        def _skip_attention_child(module_name):
+            for prefix in attention_prefixes:
+                if not prefix or not module_name.startswith(prefix + '.'):
+                    continue
+                suffix = module_name[len(prefix) + 1:]
+                # Parent TAA hook estimates attention math; keep only its optional conv branch.
+                return not (suffix == 'conv' or suffix.startswith('conv.'))
+            return False
+
         for module_name, module in self.named_modules():
             if module_name == '':
+                continue
+            if _skip_attention_child(module_name):
                 continue
             component_name = self._classify_module_component(module_name)
             if component_name is None:
@@ -674,9 +832,10 @@ class Img2PointsSmallObjectDetection(nn.Module):
         """
         device = batch['input'].device
         b, c, t, h, w = batch['input'].shape
-        self._runtime_frame_divisor = max(float(t), 1.0)
+        self._runtime_frame_divisor = max(float(b * t), 1.0)
         runtime_dict = self._new_runtime_dict() if self._runtime_enabled() else None
-        flops_dict, flops_handles = self._start_flops_capture()
+        need_stage1_profile = (not self.training) and ('bboxes' in batch)
+        flops_dict, flops_handles = self._start_flops_capture(force=need_stage1_profile)
 
         try:
             ################################运行Net1##################################
@@ -720,11 +879,19 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
             ################################运行Net2##################################
             if runtime_dict is not None:
+                mfe_runtime_meter, mfe_runtime_handles = self._start_mfe_runtime_capture(device)
                 time_start = self._runtime_start(device)
-            sp_backbone_out = self.sp_backbone(batch_dict)
+            else:
+                mfe_runtime_meter, mfe_runtime_handles = None, None
+            try:
+                sp_backbone_out = self.sp_backbone(batch_dict)
+            finally:
+                self._stop_runtime_capture(mfe_runtime_handles)
             if runtime_dict is not None:
                 stage2_total_runtime = self._runtime_stop(time_start, device)
-                mfe_runtime = float(sp_backbone_out.get('mfe_runtime', 0.0)) if isinstance(sp_backbone_out, dict) else 0.0
+                returned_mfe_runtime = float(sp_backbone_out.get('mfe_runtime', 0.0)) if isinstance(sp_backbone_out, dict) else 0.0
+                hooked_mfe_runtime = float(mfe_runtime_meter.get('MFE', 0.0)) if mfe_runtime_meter is not None else 0.0
+                mfe_runtime = returned_mfe_runtime if returned_mfe_runtime > 0.0 else hooked_mfe_runtime
                 runtime_dict['MFE'] += mfe_runtime
                 runtime_dict['BackboneNoMFE'] += max(stage2_total_runtime - mfe_runtime, 0.0)
             ##########################################################################
@@ -815,17 +982,19 @@ class Img2PointsSmallObjectDetection(nn.Module):
             # ====================== 第一阶段检测质量指标 ======================
             # 沿 W 维拼接左右两半的 binary_mask，还原全图 [B, 1, T, H, W]
             binary_mask_full = torch.cat([z_left['binary_mask'], z_right['binary_mask']], dim=-1)
+            runtime_merged = self._merge_runtime_dicts(runtime_left, runtime_right)
+            flops_merged = self._merge_runtime_dicts(flops_left, flops_right)
             if 'bboxes' in batch:
                 self._compute_and_print_stage1_metrics(
                     binary_mask=binary_mask_full,
                     bboxes=batch['bboxes'],
                     b=b, t=t, h=h, w=w,
                     device=device,
+                    sampling_rate=sampling_rate,
+                    flops_dict=flops_merged,
                 )
             # ==============================================================
 
-            runtime_merged = self._merge_runtime_dicts(runtime_left, runtime_right)
-            flops_merged = self._merge_runtime_dicts(flops_left, flops_right)
             self._update_runtime_stats(runtime_merged, flops_merged)
 
             return [z_merged]
@@ -847,6 +1016,8 @@ class Img2PointsSmallObjectDetection(nn.Module):
                     bboxes=batch['bboxes'],
                     b=b, t=t, h=h, w=w,
                     device=device,
+                    sampling_rate=sampling_rate,
+                    flops_dict=flops_dict,
                 )
             # ==============================================================
 

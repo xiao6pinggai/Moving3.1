@@ -26,6 +26,7 @@ def eval_func_final(results_dir_tol, data_dir=None, data_name=None, conf_ths = N
         conf_thresh_all = conf_ths
     else:
         conf_thresh_all =  [0.2,0.25,0.3]#[0.2,0.25,0.3] # 不太耗时
+        # conf_thresh_all =  [0.25,0.275,0.3,0.325]#[0.2,0.25,0.3] # 不太耗时
     # if opt.datasetname == 'sdm_car':
     #     conf_thresh_all =  [0.05,0.1,0.15,0.2,0.25,0.3] # 不太耗时
     if data_name is None:
