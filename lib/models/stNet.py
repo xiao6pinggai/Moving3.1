@@ -9,6 +9,7 @@ from lib.models.LightweightUnet3DDynamic import UNet
 from lib.models.I2PSOD import I2PSOD
 from lib.models.I2PSOD_test import I2PSOD_test
 from lib.models.Net1_SpDetHead import Net1_SpDetHead
+from lib.models.Net1_Net2 import Net1_Net2
 def model_lib(model_chose):
     model_factory = {
                     'sp_centerDet_minus': sp_centerDet_minus,
@@ -16,7 +17,8 @@ def model_lib(model_chose):
                     'I2PSOD': I2PSOD,
                     'Net1': Net1,
                     'I2PSOD_test': I2PSOD_test,
-                    'Net1_SpDetHead': Net1_SpDetHead
+                    'Net1_SpDetHead': Net1_SpDetHead,
+                    'Net1_Net2': Net1_Net2
                      }
     return model_factory[model_chose]
 
@@ -26,7 +28,7 @@ def get_det_net(heads, model_name, img_size, img_num, opt, thresh=None):
         model = model_func(heads, img_size, img_num, layers=opt.layers, thresh=thresh)
     elif model_name == 'LightweightUnet3DDynamic':
         model = model_func(out_channel_list=[32, 64, 128], num_classes=1)
-    elif model_name in {'I2PSOD', 'Net1', 'I2PSOD_test', 'Net1_SpDetHead'}:
+    elif model_name in {'I2PSOD', 'Net1', 'I2PSOD_test', 'Net1_SpDetHead', 'Net1_Net2'}:
         model_kwargs = dict(
             image_size=img_size,
             img_num=opt.seqLen,

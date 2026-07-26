@@ -7,6 +7,7 @@ import os, sys
 import time
 import atexit
 import math
+import inspect
 
 # 向上查找项目根目录并加入 sys.path（支持 autodl/本地 Windows 双环境）
 _cur = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,7 @@ from lib.models.spconv_utils import replace_feature, spconv
 from lib.models.noramlconv_unet3d2_1 import UNet2DWithNormalConv2D, UNet3DWithNormalConv3D, LightWeightedConv3D, EncoderOnlyConv3DProposalNet, TOSConvNet, TPConvNet, TZSConvNet, DynamicTOSConvNet
 from lib.models.profile_utils import count_parameters, estimate_module_flops, estimate_sigmoid_flops, extract_feature_tensor
 from lib.utils1.show_one_img import show_one_img
+from lib.utils1.save_img import save_net1_output
 import torch
 
 class Img2PointsSmallObjectDetection(nn.Module):
@@ -257,7 +259,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
         # 动态阈值：均值 + 系数 * 标准差
         dynamic_thresh = mask_mean + var_coeff * mask_std
-
+        # dynamic_thresh = 0.3
         # 初始二值掩码 [B, 1, T, H, W]
         binary_mask = (soft_mask > dynamic_thresh).float()
 
@@ -779,6 +781,72 @@ class Img2PointsSmallObjectDetection(nn.Module):
         flops += elements
         return flops
 
+    def _get_softmask_vis_context(self, batch=None):
+        if isinstance(batch, dict):
+            save_dir = batch.get("softmask_save_dir")
+            frame_names = batch.get("softmask_frame_names")
+            video_name = batch.get("softmask_video_name")
+            if isinstance(save_dir, (list, tuple)):
+                save_dir = save_dir[0] if len(save_dir) > 0 else None
+            if save_dir is not None:
+                save_dir = str(save_dir)
+                if video_name is not None:
+                    save_dir = os.path.join(save_dir, str(video_name))
+                return save_dir, frame_names
+
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back
+            while frame is not None:
+                local_vars = frame.f_locals
+                save_mat_folder = local_vars.get("save_mat_folder")
+                save_mat_path_upper = local_vars.get("save_mat_path_upper")
+                patch_ims = local_vars.get("patch_ims")
+                if save_mat_folder is not None:
+                    video_name = os.path.basename(str(save_mat_folder))
+                    if save_mat_path_upper is None:
+                        save_mat_path_upper = os.path.dirname(str(save_mat_folder))
+                    save_dir = os.path.join(str(save_mat_path_upper), "softmask_vis", video_name)
+                    return save_dir, patch_ims
+                frame = frame.f_back
+        finally:
+            del frame
+
+        return "net1_softmask_vis", None
+
+    def _save_net1_softmask_vis(self, net1_output, batch=None, max_images=10):
+        save_dir, frame_names = self._get_softmask_vis_context(batch)
+        counters = getattr(self, "_softmask_vis_counter_by_dir", None)
+        if counters is None:
+            counters = {}
+            self._softmask_vis_counter_by_dir = counters
+        saved_count = counters.get(save_dir, 0)
+        if saved_count >= max_images:
+            return
+
+        with torch.no_grad():
+            soft_mask = torch.sigmoid(net1_output.detach())
+            if soft_mask.shape[1] > 1:
+                soft_mask = soft_mask.mean(dim=1, keepdim=True)
+
+        os.makedirs(save_dir, exist_ok=True)
+        bsz, _, frames, _, _ = soft_mask.shape
+        for b_i in range(bsz):
+            for t_i in range(frames):
+                if saved_count >= max_images:
+                    counters[save_dir] = saved_count
+                    return
+                if frame_names is not None and t_i < len(frame_names):
+                    stem = os.path.splitext(os.path.basename(str(frame_names[t_i])))[0]
+                    if bsz > 1:
+                        stem = f"{stem}_b{b_i}"
+                else:
+                    stem = f"{saved_count:06d}_b{b_i}_t{t_i}_softmask"
+                imgpath = os.path.join(save_dir, stem + ".png")
+                save_net1_output(soft_mask[b_i, 0, t_i], imgpath, mode="255")
+                saved_count += 1
+        counters[save_dir] = saved_count
+
     # ############ 原始 forward（非滑窗版本，已切换至下方滑窗版本）############
     # def forward(self, batch):
     #     device = batch['input'].device
@@ -997,6 +1065,9 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
             self._update_runtime_stats(runtime_merged, flops_merged)
 
+            if False and not self.training:
+                self._save_net1_softmask_vis(z_merged['hm_large_heatmap'], batch)
+
             return [z_merged]
 
         else:
@@ -1022,6 +1093,9 @@ class Img2PointsSmallObjectDetection(nn.Module):
             # ==============================================================
 
             self._update_runtime_stats(runtime_dict, flops_dict)
+
+            if True and not self.training:
+                self._save_net1_softmask_vis(z['hm_large_heatmap'], batch)
 
             return [z]
     ################################################滑窗推理######################################################

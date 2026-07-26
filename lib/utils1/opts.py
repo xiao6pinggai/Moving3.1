@@ -27,14 +27,14 @@ class opts(object):
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         # basic experiment setting
-        self.parser.add_argument('--discribe', default='xrsy_fix0.5_v23_321_seqlen10') #v21_cuda_bottle_w7_k5_weightedposgate 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
+        self.parser.add_argument('--discribe', default='xrsy_Net1_Net2') #v21_cuda_bottle_w7_k5_weightedposgate 修改1 # enc修改为二分支空洞时空解耦，空间保留dilation,CDC，时间2 3 dilation,去掉0sum为正常时域3*3*3卷积，取消保底branch的1*1，时间后bnrelu conv1*1*1,然后和空间先cat再1*1*1降维输出  增加了归一化以及snext与sprev相乘，算得分，输出使用biqkv且不做v交互，qk矩阵共享， # SGNet_Linear10_MFE_TOSConv_T11_newnet2_cosv10
         self.parser.add_argument('--task', default='ctdet_points',
                                  help='task name.  ctdet_points |  ctdet ')
-        self.parser.add_argument('--exp_name',default='xrsy_fix0.5_v23_321_seqlen10',# 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
+        self.parser.add_argument('--exp_name',default='xrsy_Net1_Net2',# 'unsupervised_iterative_layers_3_', # I2PSOD # # 修改2
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3        
-        self.parser.add_argument('--model_name', default='I2PSOD', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3 # Net1
-        self.parser.add_argument('--load_model', default= "")
+        self.parser.add_argument('--model_name', default='Net1_Net2', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3 # Net1_SpDetHead # Net1_Net2 
+        self.parser.add_argument('--load_model', default= "weights/rs_car_new_multi/Net1_Net2/xrsy_Net1_Net2_supMode_0_seglen10_weights2026_07_25_02_07_35/model_best_dis_f1_best.pth")
         self.parser.add_argument('--resume', type=bool, default=True, help='resume an experiment.')
         self.parser.add_argument('--down_ratio', type=int, default=1, help='output stride. Currently only supports for 1.')
         # system
@@ -167,7 +167,7 @@ class opts(object):
             opt.batch_size= 8
         if opt.seqLen == 10:
             opt.data_sampling = 10
-            opt.batch_size= 8  # 默认8
+            opt.batch_size= 4  # 默认8
         elif opt.seqLen == 15:
             opt.data_sampling = 15
             opt.batch_size= 8

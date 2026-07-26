@@ -210,6 +210,7 @@ class Net1SparseDetHead(nn.Module):
         mask_mean = torch.mean(soft_mask, dim=[-2, -1]).unsqueeze(-1).unsqueeze(-1)
         mask_std = torch.std(soft_mask, dim=[-2, -1]).unsqueeze(-1).unsqueeze(-1)
         dynamic_thresh = mask_mean + var_coeff * mask_std
+        # dynamic_thresh = 0.5
         binary_mask = (soft_mask > dynamic_thresh).float()
 
         binary_mask_flat = binary_mask.view(B, -1)
