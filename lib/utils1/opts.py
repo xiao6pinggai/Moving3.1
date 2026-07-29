@@ -34,7 +34,7 @@ class opts(object):
                                  help='name of the experiments.')
         self.parser.add_argument('--layers', type=float, default=3.61, help='use decomp model or not.')  # 默认是3        
         self.parser.add_argument('--model_name', default='Net1_Net2', help='name of the model.') # sp_centerDet_minus # LightweightUnet3DDynamic # I2PSOD # Net1 # I2PSOD_test # 修改3 # Net1_SpDetHead # Net1_Net2 
-        self.parser.add_argument('--load_model', default= "weights/rs_car_new_multi/Net1_Net2/xrsy_Net1_Net2_supMode_0_seglen10_weights2026_07_25_02_07_35/model_best_dis_f1_best.pth")
+        self.parser.add_argument('--load_model', default= "")
         self.parser.add_argument('--resume', type=bool, default=True, help='resume an experiment.')
         self.parser.add_argument('--down_ratio', type=int, default=1, help='output stride. Currently only supports for 1.')
         # system
@@ -136,12 +136,12 @@ class opts(object):
         self.parser.add_argument('--MFE_skip', type=str, default='[1,1,1]', help='MFE skip switches for [conv1, conv2, conv3], e.g. [1,0,1]')
         self.parser.add_argument('--MFErepeat', type=str, default='[0,0,0]', help='cosv22 repeat count per [conv1, conv2, conv3]; single value is broadcast')
         self.parser.add_argument('--topk_relu', type=str, default='fanghui', choices=['fanghui', 'bufanghui'], help='triplet top-k matching rule: fanghui allows point reuse, bufanghui forbids reuse')
-        self.parser.add_argument('--tmc_topk', type=str, default='[3,2,1]', help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28 top-k per [conv1, conv2, conv3]; single value is broadcast')
-        self.parser.add_argument('--tmc_window_size', type=str, default='[15,11,7]', help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28 window size per [conv1, conv2, conv3]; single value is broadcast')
-        self.parser.add_argument('--tmc_hidden_ratio', type=float, default=0.5, help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28 FFN hidden channel ratio')
+        self.parser.add_argument('--tmc_topk', type=str, default='[3,2,1]', help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28/CA top-k per [conv1, conv2, conv3]; single value is broadcast')
+        self.parser.add_argument('--tmc_window_size', type=str, default='[15,11,7]', help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28/CA window size per [conv1, conv2, conv3]; single value is broadcast')
+        self.parser.add_argument('--tmc_hidden_ratio', type=float, default=0.5, help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28/CA FFN hidden channel ratio')
         self.parser.add_argument('--tmc_pos_hidden', type=int, default=16, help='cosv18/v21 position MLP hidden channels; v20 uses 0.5*C')
-        self.parser.add_argument('--tmc_pos_scale', type=float, default=16.0, help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28 coordinate normalization scale')
-        self.parser.add_argument('--tmc_chunk_size', type=int, default=999999999, help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28 query chunk size; <=0 uses adaptive large-block chunking')
+        self.parser.add_argument('--tmc_pos_scale', type=float, default=16.0, help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28/CA coordinate normalization scale')
+        self.parser.add_argument('--tmc_chunk_size', type=int, default=999999999, help='cosv18/v20/v21/v23/v24/v25/v26/v27/v28/CA query chunk size; <=0 uses adaptive large-block chunking')
         self.parser.add_argument('--tmc_ffn_position', type=str, default='before_mean', choices=['before_mean', 'after_mean'], help='cosv18/v21 FFN placement: before_mean keeps per-pair FFN; after_mean applies FFN after pair averaging')
         #可视化 # cosv10 
         self.parser.add_argument('--vis_features', type=bool, default=False, help='whether to visualize feature maps')
@@ -167,7 +167,7 @@ class opts(object):
             opt.batch_size= 8
         if opt.seqLen == 10:
             opt.data_sampling = 10
-            opt.batch_size= 4  # 默认8
+            opt.batch_size= 8  # 默认8
         elif opt.seqLen == 15:
             opt.data_sampling = 15
             opt.batch_size= 8
@@ -177,7 +177,8 @@ class opts(object):
         elif opt.seqLen == 40:
             opt.data_sampling = 40
             opt.batch_size= 4
-        
+        if opt.model_name == 'Net1_Net2':
+            opt.batch_size= 4
         if opt.datasetname == 'rs_car_new':
             opt.data_dir = '/root/autodl-tmp/RsCarData_New_Part/'
             # opt.data_dir = 'E:/NUDT-Master/Academic/DataSet/RsCarData_New_Part/'

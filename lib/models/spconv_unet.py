@@ -35,6 +35,7 @@ from lib.models.cos_update_v27 import TripletMotionConsistencyMotionPairSparseCo
 from lib.models.cos_update_v28 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV28
 from lib.models.cos_update_v29 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV29
 from lib.models.cos_update_v30 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV30
+from lib.models.ca import TripletMotionConsistencyMotionPairSparseConv as CrossFrameAttentionSparseConvCA
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
@@ -56,6 +57,7 @@ MFE_MODULE_NAMES = (
     'cosv28', 'tmc_feature_pair_bin_attn', 'tmc_feature_pair_bin_attn_sconv',
     'cosv29', 'tmc_feature_pair_sigmoid_attn', 'tmc_feature_pair_sigmoid_attn_sconv',
     'cosv30', 'tmc_feature_pair_sigmoid_9d_attn', 'tmc_feature_pair_sigmoid_9d_attn_sconv',
+    'ca', 'cross_frame_attn', 'cross_frame_attn_sconv',
 )
 BOTTLE_MFE_WITH_2_BLOCK = 'mfew2block'
 
@@ -166,11 +168,13 @@ def build_mfe_module(mfe_name, *args, opt=None, **kwargs):
         mfe_cls = TripletMotionConsistencyMotionPairSparseConvV29
     elif mfe_name in ('cosv30', 'tmc_feature_pair_sigmoid_9d_attn', 'tmc_feature_pair_sigmoid_9d_attn_sconv'):
         mfe_cls = TripletMotionConsistencyMotionPairSparseConvV30
+    elif mfe_name in ('ca', 'cross_frame_attn', 'cross_frame_attn_sconv'):
+        mfe_cls = CrossFrameAttentionSparseConvCA
     else:
         raise ValueError(f'Unknown mfe_name: {mfe_name}')
     if opt is not None and mfe_name in ('cosv13', 'frstt', 'cosv14', 'ocatf', 'object_token', 'cosv15', 'sttm', 'sparse_traj_token'):
         kwargs['num_frames'] = int(opt.seqLen)
-    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv', 'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv', 'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv', 'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv', 'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv', 'cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv', 'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv', 'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv', 'cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv', 'cosv28', 'tmc_feature_pair_bin_attn', 'tmc_feature_pair_bin_attn_sconv', 'cosv29', 'tmc_feature_pair_sigmoid_attn', 'tmc_feature_pair_sigmoid_attn_sconv', 'cosv30', 'tmc_feature_pair_sigmoid_9d_attn', 'tmc_feature_pair_sigmoid_9d_attn_sconv'):
+    if opt is not None and mfe_name in ('cosv16', 'tmc', 'tmc_sconv', 'cosv17', 'tmc_cos', 'tmc_cos_sconv', 'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv', 'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv', 'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv', 'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv', 'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv', 'cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv', 'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv', 'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv', 'cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv', 'cosv28', 'tmc_feature_pair_bin_attn', 'tmc_feature_pair_bin_attn_sconv', 'cosv29', 'tmc_feature_pair_sigmoid_attn', 'tmc_feature_pair_sigmoid_attn_sconv', 'cosv30', 'tmc_feature_pair_sigmoid_9d_attn', 'tmc_feature_pair_sigmoid_9d_attn_sconv', 'ca', 'cross_frame_attn', 'cross_frame_attn_sconv'):
         topk_values = parse_triplet_values(opt.tmc_topk, int, 'tmc_topk')
         window_values = parse_triplet_values(opt.tmc_window_size, int, 'tmc_window_size')
         idx = int(tmc_level) if tmc_level is not None else 0
@@ -206,7 +210,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         self.model_cfg = model_cfg  # None
         self.opt = kwargs['opt']
         try:
-            self.MFE = self.opt.MFE
+            self.MFE = parse_optional_module_name(self.opt.MFE)
         except:
             self.MFE = None
             print("Warning: MFE is not specified in opt, set to None.")
@@ -421,6 +425,20 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         x = replace_feature(x, features.view(n, out_channels, -1).sum(dim=2))
         return x
 
+
+    @staticmethod
+    def _snapshot_sparse_tensor(x):
+        spatial_shape = getattr(x, "spatial_shape", None)
+        if spatial_shape is None:
+            spatial_shape = []
+        spatial_shape = tuple(int(v) for v in list(spatial_shape)[:3])
+        return {
+            "features": x.features.detach().float().cpu(),
+            "indices": x.indices.detach().int().cpu(),
+            "spatial_shape": spatial_shape,
+            "batch_size": int(getattr(x, "batch_size", 1)),
+        }
+
     def forward(self, batch_dict):
         """
         Args:
@@ -436,6 +454,8 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         """
         voxel_features, voxel_coords = batch_dict['voxel_features'], batch_dict['voxel_coords']
         batch_size = batch_dict['batch_size']
+        capture_taa_heatmap = bool(batch_dict.get("capture_taa_heatmap", False)) and self.MFE in MFE_MODULE_NAMES
+        taa_skip_features = [] if capture_taa_heatmap else None
 
         input_sp_tensor = spconv.SparseConvTensor(
             features=voxel_features,
@@ -476,7 +496,14 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # x_conv3 is the deepest skip and x_bottle is the bottom branch.
         # ------------------------------------------------------------------
         if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[2]:
+            taa_before = self._snapshot_sparse_tensor(x_conv3) if taa_skip_features is not None else None
             x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
+            if taa_skip_features is not None:
+                taa_skip_features.append({
+                    "skip": 3,
+                    "before": taa_before,
+                    "after": self._snapshot_sparse_tensor(x_conv3),
+                })
             # x_conv3 = self.shortcut3fusion(x_conv3)
 
         x_up3 = self.UR_block_forward(
@@ -488,7 +515,14 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         )
 
         if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[1]:
+            taa_before = self._snapshot_sparse_tensor(x_conv2) if taa_skip_features is not None else None
             x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
+            if taa_skip_features is not None:
+                taa_skip_features.append({
+                    "skip": 2,
+                    "before": taa_before,
+                    "after": self._snapshot_sparse_tensor(x_conv2),
+                })
             # x_conv2 = self.shortcut2fusion(x_conv2)
 
         x_up2 = self.UR_block_forward(
@@ -500,7 +534,14 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         )
 
         if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[0]:
+            taa_before = self._snapshot_sparse_tensor(x_conv1) if taa_skip_features is not None else None
             x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
+            if taa_skip_features is not None:
+                taa_skip_features.append({
+                    "skip": 1,
+                    "before": taa_before,
+                    "after": self._snapshot_sparse_tensor(x_conv1),
+                })
             # x_conv1 = self.shortcut1fusion(x_conv1)
 
         x_up1 = self.UR_block_forward(
@@ -517,7 +558,9 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         # 这里保留你原代码的设置，避免影响后续模块接口。
         # 但从当前 U-Net 输出分辨率看，x_up1 已经回到 conv1/input 同级分辨率。
         # 如果后续模块严格使用真实 stride，这里理论上应检查是否需要改为 1。
-        batch_dict['encoded_spconv_tensor_stride'] = 8
+        batch_dict["encoded_spconv_tensor_stride"] = 8
+        if taa_skip_features is not None:
+            batch_dict["taa_skip_features"] = taa_skip_features
 
         return batch_dict
 ###################################################################################################################

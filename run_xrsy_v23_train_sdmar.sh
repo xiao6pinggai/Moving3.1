@@ -11,51 +11,34 @@ cd "$(dirname "$0")"
 #   --model_name I2PSOD\
 #   --datasetname sdm_car \
 
-echo "[$(date '+%F %T')] Start: xrsy_v23_10_111_re321"
+echo "[$(date '+%F %T')] Start: xrsy_Net1_Net2"
 python train.py \
-  --discribe xrsyre1_v23_10_111_re321 \
-  --exp_name xrsyre1_v23_10_111_re321 \
-  --tmc_topk [3,2,1] \
-  --model_name I2PSOD\
+  --discribe xrsy_Net1_Net2 \
+  --exp_name xrsy_Net1_Net2 \
+  --model_name Net1_Net2\
   --datasetname sdm_car \
 
-echo "[$(date '+%F %T')] Start: xrsy_v23_10_111_re321"
+echo "[$(date '+%F %T')] Start: xrsy_CA"
 python train.py \
-  --discribe xrsyre2_v23_10_111_re321 \
-  --exp_name xrsyre2_v23_10_111_re321 \
-  --tmc_topk [3,2,1] \
-  --model_name I2PSOD\
+  --discribe xrsy_CA \
+  --exp_name xrsy_CA \
+  --model_name I2PSOD \
   --datasetname sdm_car \
+  --MFE CA \
 
-echo "[$(date '+%F %T')] Start: xrsy_v23_10_111_re321"
+echo "[$(date '+%F %T')] Start: xrsy_th1"
 python train.py \
-  --discribe xrsyre3_v23_10_111_re321 \
-  --exp_name xrsyre3_v23_10_111_re321 \
-  --tmc_topk [3,2,1] \
-  --model_name I2PSOD\
+  --discribe xrsy_th1 \
+  --exp_name xrsy_th1 \
+  --model_name I2PSOD \
   --datasetname sdm_car \
+  --thresh 1 \
 
-echo "[$(date '+%F %T')] Start: xrsy_v23_10_111_re321"
+echo "[$(date '+%F %T')] Start: xrsy_th5"
 python train.py \
-  --discribe xrsyre4_v23_10_111_re321 \
-  --exp_name xrsyre4_v23_10_111_re321 \
-  --tmc_topk [3,2,1] \
-  --model_name I2PSOD\
+  --discribe xrsy_th5 \
+  --exp_name xrsy_th5 \
+  --model_name I2PSOD \
   --datasetname sdm_car \
-  
-echo "[$(date '+%F %T')] Start: xrsy_v23_10_111_re321"
-python train.py \
-  --discribe xrsyre5_v23_10_111_re321 \
-  --exp_name xrsyre5_v23_10_111_re321 \
-  --tmc_topk [3,2,1] \
-  --model_name I2PSOD\
-  --datasetname sdm_car \
-
-echo "[$(date '+%F %T')] Start: xrsy_v23_10_111_re321"
-python train.py \
-  --discribe xrsyre6_v23_10_111_re321 \
-  --exp_name xrsyre6_v23_10_111_re321 \
-  --tmc_topk [3,2,1] \
-  --model_name I2PSOD\
-  --datasetname sdm_car \
+  --thresh 5 \
 echo "[$(date '+%F %T')] All training jobs finished."

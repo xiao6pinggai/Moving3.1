@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 import numpy as np
+import cv2
 import os, sys
 import time
 import atexit
@@ -847,6 +848,288 @@ class Img2PointsSmallObjectDetection(nn.Module):
                 saved_count += 1
         counters[save_dir] = saved_count
 
+    def _get_taa_heatmap_vis_context(self, batch=None):
+        softmask_dir, frame_names = self._get_softmask_vis_context(batch)
+        softmask_dir = str(softmask_dir)
+        norm_dir = softmask_dir.rstrip(os.sep)
+        video_name = os.path.basename(norm_dir) or "unknown_video"
+        softmask_parent = os.path.dirname(norm_dir)
+        if os.path.basename(softmask_parent) == "softmask_vis":
+            root_dir = os.path.dirname(softmask_parent)
+        else:
+            root_dir = os.path.dirname(norm_dir) or "."
+        return os.path.join(root_dir, "heatmap_taa"), video_name, frame_names
+
+    def _taa_heatmap_vis_has_budget(self, batch=None, max_images=10):
+        root_dir, video_name, _ = self._get_taa_heatmap_vis_context(batch)
+        key = os.path.join(root_dir, video_name)
+        counters = getattr(self, "_taa_heatmap_vis_counter_by_video", None)
+        return counters is None or counters.get(key, 0) < max_images
+
+
+    @staticmethod
+    def _taa_heatmap_frame_stem(frame_names, t_i, saved_count, b_i, bsz):
+        stem = None
+        if frame_names is not None and t_i < len(frame_names):
+            stem = os.path.splitext(os.path.basename(str(frame_names[t_i])))[0]
+        if not stem:
+            stem = f"{saved_count + 1:06d}"
+        elif stem.isdigit():
+            stem = f"{int(stem):06d}"
+        if bsz > 1:
+            stem = f"{stem}_b{b_i}"
+        return stem
+
+
+    @staticmethod
+    def _taa_snapshot_shape(snapshot):
+        shape = list(snapshot.get("spatial_shape") or [])
+        while len(shape) < 3:
+            shape.append(0)
+        indices = snapshot.get("indices")
+        if indices is not None and torch.is_tensor(indices) and indices.numel() > 0:
+            max_coords = indices.long().max(dim=0)[0]
+            shape[0] = max(int(shape[0]), int(max_coords[1].item()) + 1)
+            shape[1] = max(int(shape[1]), int(max_coords[2].item()) + 1)
+            shape[2] = max(int(shape[2]), int(max_coords[3].item()) + 1)
+        return max(int(shape[0]), 1), max(int(shape[1]), 1), max(int(shape[2]), 1)
+
+    def _sparse_snapshot_to_frame_map(self, snapshot, b_i, t_i, mode):
+        _, h, w = self._taa_snapshot_shape(snapshot)
+        heat = np.full((h, w), np.nan, dtype=np.float32)
+        features = snapshot.get("features")
+        indices = snapshot.get("indices")
+        if features is None or indices is None or not torch.is_tensor(features) or not torch.is_tensor(indices):
+            return heat
+        if features.numel() == 0 or indices.numel() == 0:
+            return heat
+
+        indices = indices.long()
+        frame_mask = (indices[:, 0] == int(b_i)) & (indices[:, 1] == int(t_i))
+        if not bool(frame_mask.any().item()):
+            return heat
+
+        frame_features = features[frame_mask].float()
+        if mode == "max":
+            values = frame_features.max(dim=1)[0]
+        else:
+            values = frame_features.mean(dim=1)
+
+        frame_coords = indices[frame_mask]
+        ys = frame_coords[:, 2].clamp(0, h - 1).cpu().numpy()
+        xs = frame_coords[:, 3].clamp(0, w - 1).cpu().numpy()
+        heat[ys, xs] = values.detach().cpu().numpy().astype(np.float32)
+        return heat
+
+
+    @staticmethod
+    def _taa_heatmap_vmax(*frame_maps):
+        value_parts = []
+        for frame_map in frame_maps:
+            if frame_map is None:
+                continue
+            valid_mask = np.isfinite(frame_map)
+            if valid_mask.any():
+                value_parts.append(frame_map[valid_mask].astype(np.float32))
+        if not value_parts:
+            return 1.0
+        values = np.concatenate(value_parts)
+        return max(float(np.nanmax(values)), 1e-6)
+
+    @staticmethod
+    def _colorize_taa_heatmap(frame_map, vmax, valid_mask=None):
+        lut = Img2PointsSmallObjectDetection._taa_heatmap_lut()
+        vmax = max(float(vmax), 1e-6)
+        norm = np.nan_to_num(frame_map, nan=0.0, posinf=vmax, neginf=0.0) / vmax
+        gray = np.clip(norm * 255.0, 0, 255).astype(np.uint8)
+        color = lut[gray]
+        if valid_mask is not None:
+            color[~valid_mask] = lut[0]
+        return color
+
+    @staticmethod
+    def _save_taa_heatmap_pair(before_map, after_map, before_path, after_path):
+        valid_before = np.isfinite(before_map)
+        valid_after = np.isfinite(after_map)
+        vmax = Img2PointsSmallObjectDetection._taa_heatmap_vmax(before_map, after_map)
+
+        os.makedirs(os.path.dirname(before_path), exist_ok=True)
+        os.makedirs(os.path.dirname(after_path), exist_ok=True)
+        cv2.imwrite(before_path, Img2PointsSmallObjectDetection._colorize_taa_heatmap(before_map, vmax, valid_before))
+        cv2.imwrite(after_path, Img2PointsSmallObjectDetection._colorize_taa_heatmap(after_map, vmax, valid_after))
+        return vmax
+
+    @staticmethod
+    def _save_src_heatmap(src_map, src_path, vmax):
+        os.makedirs(os.path.dirname(src_path), exist_ok=True)
+        cv2.imwrite(src_path, Img2PointsSmallObjectDetection._colorize_taa_heatmap(src_map, vmax))
+
+    @staticmethod
+    def _taa_src_root_dir(taa_root_dir):
+        norm_dir = str(taa_root_dir).rstrip(os.sep)
+        if os.path.basename(norm_dir) == "heatmap_taa":
+            return os.path.join(os.path.dirname(norm_dir), "heatmap_src")
+        return norm_dir + "_src"
+
+    @staticmethod
+    def _prepare_src_heatmap_array(source_heatmap):
+        if source_heatmap is None:
+            return None
+        if torch.is_tensor(source_heatmap):
+            with torch.no_grad():
+                src = source_heatmap.detach()
+                if src.dim() != 5:
+                    return None
+                if src.shape[1] > 1:
+                    src = src.mean(dim=1, keepdim=True)
+                return src[:, 0].float().cpu().numpy().astype(np.float32)
+        src = np.asarray(source_heatmap, dtype=np.float32)
+        if src.ndim == 5:
+            if src.shape[1] > 1:
+                src = src.mean(axis=1, keepdims=True)
+            src = src[:, 0]
+        if src.ndim != 4:
+            return None
+        return src.astype(np.float32)
+
+    @staticmethod
+    def _src_heatmap_to_frame_map(source_heatmap_np, b_i, t_i, target_shape):
+        if source_heatmap_np is None:
+            return None
+        if b_i >= source_heatmap_np.shape[0] or t_i >= source_heatmap_np.shape[1]:
+            return None
+        target_h, target_w = int(target_shape[0]), int(target_shape[1])
+        frame_map = np.nan_to_num(source_heatmap_np[b_i, t_i], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        if frame_map.shape != (target_h, target_w):
+            interpolation = cv2.INTER_AREA if frame_map.shape[0] >= target_h and frame_map.shape[1] >= target_w else cv2.INTER_LINEAR
+            frame_map = cv2.resize(frame_map, (target_w, target_h), interpolation=interpolation).astype(np.float32)
+        return frame_map
+
+    @staticmethod
+    def _taa_heatmap_lut():
+        cached_lut = getattr(Img2PointsSmallObjectDetection, "_taa_heatmap_lut_cache", None)
+        if cached_lut is not None:
+            return cached_lut
+        stops = np.asarray([
+            [0.00, 128, 32, 0],
+            [0.18, 255, 96, 0],
+            [0.38, 255, 210, 0],
+            [0.58, 80, 230, 255],
+            [0.78, 0, 140, 255],
+            [1.00, 0, 0, 255],
+        ], dtype=np.float32)
+        sample_points = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+        lut = np.empty((256, 3), dtype=np.uint8)
+        for channel in range(3):
+            lut[:, channel] = np.interp(sample_points, stops[:, 0], stops[:, channel + 1]).astype(np.uint8)
+        Img2PointsSmallObjectDetection._taa_heatmap_lut_cache = lut
+        return lut
+
+    def _save_taa_heatmap_vis(self, taa_skip_features, batch=None, source_heatmap=None, max_images=10):
+        if not taa_skip_features:
+            return
+        root_dir, video_name, frame_names = self._get_taa_heatmap_vis_context(batch)
+        src_root_dir = self._taa_src_root_dir(root_dir)
+        source_heatmap_np = self._prepare_src_heatmap_array(source_heatmap)
+        key = os.path.join(root_dir, video_name)
+        counters = getattr(self, "_taa_heatmap_vis_counter_by_video", None)
+        if counters is None:
+            counters = {}
+            self._taa_heatmap_vis_counter_by_video = counters
+        saved_count = counters.get(key, 0)
+        if saved_count >= max_images:
+            return
+
+        skip_items = sorted(taa_skip_features, key=lambda item: int(item.get("skip", 0)))
+        bsz = 1
+        frames = 1
+        for item in skip_items:
+            for phase in ("before", "after"):
+                snapshot = item.get(phase)
+                if not snapshot:
+                    continue
+                cur_t, _, _ = self._taa_snapshot_shape(snapshot)
+                frames = max(frames, cur_t)
+                bsz = max(bsz, int(snapshot.get("batch_size", 1)))
+        if frame_names is not None:
+            frames = max(frames, len(frame_names))
+
+        for b_i in range(bsz):
+            for t_i in range(frames):
+                if saved_count >= max_images:
+                    counters[key] = saved_count
+                    return
+                frame_stem = self._taa_heatmap_frame_stem(frame_names, t_i, saved_count, b_i, bsz)
+                for mode in ("max", "mean"):
+                    for item in skip_items:
+                        skip = int(item.get("skip", 0))
+                        before_snapshot = item.get("before")
+                        after_snapshot = item.get("after")
+                        if not before_snapshot or not after_snapshot:
+                            continue
+                        before_map = self._sparse_snapshot_to_frame_map(before_snapshot, b_i, t_i, mode)
+                        after_map = self._sparse_snapshot_to_frame_map(after_snapshot, b_i, t_i, mode)
+                        save_dir = os.path.join(root_dir, mode, video_name, f"skip{skip}")
+                        before_path = os.path.join(save_dir, f"{frame_stem}_0before.png")
+                        after_path = os.path.join(save_dir, f"{frame_stem}_1after.png")
+                        vmax = self._save_taa_heatmap_pair(before_map, after_map, before_path, after_path)
+                        src_map = self._src_heatmap_to_frame_map(source_heatmap_np, b_i, t_i, before_map.shape)
+                        if src_map is not None:
+                            src_dir = os.path.join(src_root_dir, mode, video_name, f"skip{skip}")
+                            src_path = os.path.join(src_dir, f"{frame_stem}_src.png")
+                            self._save_src_heatmap(src_map, src_path, vmax)
+                saved_count += 1
+        counters[key] = saved_count
+
+
+    @staticmethod
+    def _taa_snapshot_width(snapshot):
+        _, _, width = Img2PointsSmallObjectDetection._taa_snapshot_shape(snapshot)
+        return width
+
+
+    @staticmethod
+    def _merge_taa_snapshot_width(left_snapshot, right_snapshot):
+        if left_snapshot is None:
+            return right_snapshot
+        if right_snapshot is None:
+            return left_snapshot
+        width_offset = Img2PointsSmallObjectDetection._taa_snapshot_width(left_snapshot)
+        right_indices = right_snapshot["indices"].clone()
+        if right_indices.numel() > 0:
+            right_indices[:, 3] += int(width_offset)
+        left_shape = Img2PointsSmallObjectDetection._taa_snapshot_shape(left_snapshot)
+        right_shape = Img2PointsSmallObjectDetection._taa_snapshot_shape(right_snapshot)
+        return {
+            "features": torch.cat([left_snapshot["features"], right_snapshot["features"]], dim=0),
+            "indices": torch.cat([left_snapshot["indices"], right_indices], dim=0),
+            "spatial_shape": (max(left_shape[0], right_shape[0]), max(left_shape[1], right_shape[1]), left_shape[2] + right_shape[2]),
+            "batch_size": max(int(left_snapshot.get("batch_size", 1)), int(right_snapshot.get("batch_size", 1))),
+        }
+
+
+    @staticmethod
+    def _merge_taa_heatmap_features(left_items, right_items):
+        if not left_items:
+            return right_items
+        if not right_items:
+            return left_items
+        right_by_skip = {int(item.get("skip", 0)): item for item in right_items}
+        merged = []
+        for left_item in left_items:
+            skip = int(left_item.get("skip", 0))
+            right_item = right_by_skip.pop(skip, None)
+            if right_item is None:
+                merged.append(left_item)
+                continue
+            merged.append({
+                "skip": skip,
+                "before": Img2PointsSmallObjectDetection._merge_taa_snapshot_width(left_item.get("before"), right_item.get("before")),
+                "after": Img2PointsSmallObjectDetection._merge_taa_snapshot_width(left_item.get("after"), right_item.get("after")),
+            })
+        merged.extend(right_by_skip.values())
+        return merged
+
     # ############ 原始 forward（非滑窗版本，已切换至下方滑窗版本）############
     # def forward(self, batch):
     #     device = batch['input'].device
@@ -940,8 +1223,11 @@ class Img2PointsSmallObjectDetection(nn.Module):
             voxel_feature_channels = net1_output.shape[1]
             voxel_features_flat = net1_output.permute(0, 2, 3, 4, 1).reshape(b * t * h * patch_w, voxel_feature_channels)
             batch_dict['voxel_features'] = voxel_features_flat[flattened_indices]
-            batch_dict['voxel_coords'] = coords.to(device)
-            batch_dict['batch_size'] = b
+            batch_dict["voxel_coords"] = coords.to(device)
+            batch_dict["batch_size"] = b
+            # TAA heatmap vis switch: change True to False to disable.
+            if True and not self.training and self._taa_heatmap_vis_has_budget(batch):
+                batch_dict["capture_taa_heatmap"] = True
             if runtime_dict is not None:
                 runtime_dict['ACS'] += self._runtime_stop(time_start, device)
 
@@ -953,6 +1239,7 @@ class Img2PointsSmallObjectDetection(nn.Module):
                 mfe_runtime_meter, mfe_runtime_handles = None, None
             try:
                 sp_backbone_out = self.sp_backbone(batch_dict)
+                taa_skip_features = sp_backbone_out.get("taa_skip_features") if isinstance(sp_backbone_out, dict) else None
             finally:
                 self._stop_runtime_capture(mfe_runtime_handles)
             if runtime_dict is not None:
@@ -989,7 +1276,9 @@ class Img2PointsSmallObjectDetection(nn.Module):
             z['hm_large_heatmap'] = net1_output
             z['voxel_coords'] = batch_dict['voxel_coords']
             z['soft_mask'] = soft_mask
-            z['binary_mask'] = binary_mask
+            z["binary_mask"] = binary_mask
+            if taa_skip_features is not None:
+                z["taa_skip_features"] = taa_skip_features
 
             return z, runtime_dict, flops_dict
         finally:
@@ -1033,6 +1322,12 @@ class Img2PointsSmallObjectDetection(nn.Module):
 
             z_merged['hm_large_heatmap'] = torch.cat([z_left['hm_large_heatmap'], z_right['hm_large_heatmap']], dim=-1)
             z_merged['soft_mask']        = torch.cat([z_left['soft_mask'],        z_right['soft_mask']],        dim=-1)
+            taa_skip_features = self._merge_taa_heatmap_features(
+                z_left.pop("taa_skip_features", None),
+                z_right.pop("taa_skip_features", None),
+            )
+            if taa_skip_features is not None:
+                z_merged["taa_skip_features"] = taa_skip_features
 
             # (2) 拼接稀疏点云坐标 (核心操作：右半图坐标的 W 需要加上偏移量)
             coords_left  = z_left['voxel_coords']
@@ -1066,7 +1361,10 @@ class Img2PointsSmallObjectDetection(nn.Module):
             self._update_runtime_stats(runtime_merged, flops_merged)
 
             if False and not self.training:
-                self._save_net1_softmask_vis(z_merged['hm_large_heatmap'], batch)
+                self._save_net1_softmask_vis(z_merged["hm_large_heatmap"], batch)
+            if True and not self.training:
+                self._save_taa_heatmap_vis(z_merged.get("taa_skip_features"), batch, source_heatmap=z_merged.get("soft_mask"))
+            z_merged.pop("taa_skip_features", None)
 
             return [z_merged]
 
@@ -1095,7 +1393,10 @@ class Img2PointsSmallObjectDetection(nn.Module):
             self._update_runtime_stats(runtime_dict, flops_dict)
 
             if True and not self.training:
-                self._save_net1_softmask_vis(z['hm_large_heatmap'], batch)
+                self._save_net1_softmask_vis(z["hm_large_heatmap"], batch)
+            if True and not self.training:
+                self._save_taa_heatmap_vis(z.get("taa_skip_features"), batch, source_heatmap=z.get("soft_mask"))
+            z.pop("taa_skip_features", None)
 
             return [z]
     ################################################滑窗推理######################################################
