@@ -10,6 +10,7 @@ from lib.models.I2PSOD import I2PSOD
 from lib.models.I2PSOD_test import I2PSOD_test
 from lib.models.Net1_SpDetHead import Net1_SpDetHead
 from lib.models.Net1_Net2 import Net1_Net2
+from lib.models.UNet3D import UNet3D
 def model_lib(model_chose):
     model_factory = {
                     'sp_centerDet_minus': sp_centerDet_minus,
@@ -18,7 +19,8 @@ def model_lib(model_chose):
                     'Net1': Net1,
                     'I2PSOD_test': I2PSOD_test,
                     'Net1_SpDetHead': Net1_SpDetHead,
-                    'Net1_Net2': Net1_Net2
+                    'Net1_Net2': Net1_Net2,
+                    "UNet3D": UNet3D,
                      }
     return model_factory[model_chose]
 
@@ -44,6 +46,8 @@ def get_det_net(heads, model_name, img_size, img_num, opt, thresh=None):
             model = model_func(heads, **model_kwargs, opt=opt)
         else:
             model = model_func(heads, **model_kwargs, opt=opt)
+    elif model_name == 'UNet3D':
+        model = model_func(heads, input_channels=3, feat_channels=opt.feat_channels, T_pooling=opt.T_pooling, downsample_mode=opt.downsample_mode, upsample_mode=opt.upsample_mode, Snack_skip=opt.Snack_skip, Snack_max_offset=opt.Snack_max_offset, UNet3D_skip=opt.UNet3D_skip, TZSConv_skip=opt.TZSConv_skip)
     else:
         model = model_func(heads)
     return model

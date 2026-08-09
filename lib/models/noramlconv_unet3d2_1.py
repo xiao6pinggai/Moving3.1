@@ -12,7 +12,6 @@ while not os.path.exists(os.path.join(_cur, 'path_setup.py')):
 if _cur not in sys.path:
     sys.path.insert(0, _cur)
 from lib.models.TOSConv import TOSConv
-from lib.models.TOSConv_once_conv_masked import TOSConv_once_conv_masked
 from lib.models.TZSLinear import TZSLinear
 from lib.models.DynamicTOSConv import DynamicTOSConv
 from lib.models.tmf import TMF

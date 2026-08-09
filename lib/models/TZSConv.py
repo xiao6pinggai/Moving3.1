@@ -14,6 +14,8 @@ TZSConv: Temporal Zero-Sum 3D Convolution
 支持输出跳线连接 (residual add)，接口尽量匹配标准 nn.Conv3d。
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -111,29 +113,19 @@ class TZSConv(nn.Module):
         else:
             self.skip_proj = None
 
-        # self._init_weights()
+        self._init_weights()
 
     # ---------------------------------------------------------------
     # 权重初始化
     # ---------------------------------------------------------------
-    # def _init_weights(self):
-    #     """
-    #     中心脉冲初始化 (Center-Dirac Initialization)。
-
-    #     将所有权重置零，仅把时域中心的整个空间切片置为 1。
-    #     去均值后自动形成类似 [-1/3, 2/3, -1/3] 的差分算子，
-    #     保证训练起始稳定，且天然聚焦时域变化。
-    #     """
-    #     nn.init.constant_(self.weight, 0.0)
-
-    #     k_t, k_h, k_w = self.kernel_size
-    #     c_t, c_h, c_w = k_t // 2, k_h // 2, k_w // 2
-
-    #     with torch.no_grad():
-    #         self.weight[:, :, c_t, c_h, c_w] = 1.0
-
-    #     if self.bias is not None:
-    #         nn.init.zeros_(self.bias)
+    def _init_weights(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels // self.groups
+            for k in self.kernel_size:
+                fan_in *= k
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
 
         # 跳线投影由 nn.Conv3d 自带 Kaiming 初始化，无需额外处理
 

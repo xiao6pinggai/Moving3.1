@@ -1,5 +1,0 @@
-# ninja log v7
-0	22144	1782891564670845571	/root/autodl-tmp/Moving3.1/lib/triplet_v18_cuda/build/temp.linux-x86_64-3.8/triplet_topk_ext.o	936839fc81178e09
-0	39230	1782891564670845571	/root/autodl-tmp/Moving3.1/lib/triplet_v18_cuda/build/temp.linux-x86_64-3.8/triplet_topk_ext_kernel.o	c2182b84ae327b88
-13	41941	1782891803024900680	/root/autodl-tmp/Moving3.1/lib/triplet_v18_cuda/build/temp.linux-x86_64-3.8/triplet_topk_ext_kernel.o	c2182b84ae327b88
-13	42973	1782891916756354019	/root/autodl-tmp/Moving3.1/lib/triplet_v18_cuda/build/temp.linux-x86_64-3.8/triplet_topk_ext_kernel.o	c2182b84ae327b88

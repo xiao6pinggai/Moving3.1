@@ -113,6 +113,7 @@ class opts(object):
         self.parser.add_argument('--T_pooling', type=bool, default=False,  help='is pooling t dim or not')
         self.parser.add_argument('--groups', type=int, default=-1, help='net1 conv groups(must be feat_channels % == 0)')
         self.parser.add_argument('--downsample_mode', type=str, default='maxpool', help='downsample mode "stride" or "maxpool"')
+        self.parser.add_argument('--upsample_mode', type=str, default='deconv', help='upsample mode "deconv" or "trilinear"')
         self.parser.add_argument('--net1name', type=str, default='UNet3DWithNormalConv3D', help='encoder use ATDC, supports TOSConvNet/DynamicTOSConvNet/TZSConvNet/TZSconvNet')
         self.parser.add_argument('--use_tzsconv', type=str, default='tzsconv', help='temporal branch mode: "tzsconv", "tmf", or ""')
 

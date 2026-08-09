@@ -15,48 +15,14 @@ if _cur not in sys.path:
 from lib.models.spconv_utils import replace_feature, spconv
 # from lib.utils import common_utils
 from lib.models.spconv_backbone import GroupedDilatedBlock, GroupedDilatedBlock2, post_act_block
-from lib.models.cos_matchv10 import SparseSymmetricCosineAttention
-from lib.models.cos_dis_v11 import SparseSymmetricCosineAttention as SparseSymmetricCosineAttentionV11
-from lib.models.cos_update_v12 import SparseSymmetricCosineAttention as SparseSymmetricCosineAttentionV12
-from lib.models.cos_update_v13 import FrameRestrictedSparseTrajectoryTransformer
-from lib.models.cos_update_v14 import ObjectCentricAssociationTokenFusion
-from lib.models.cos_update_v15 import SparseTrajectoryTokenModule
-from lib.models.cos_update_v16 import TripletMotionConsistencySparseConv as TripletMotionConsistencySparseConvV16
-from lib.models.cos_update_v17 import TripletMotionConsistencyCosineSparseConv
-from lib.models.cos_update_v18 import TripletMotionConsistencyMotionPairSparseConv
-from lib.models.cos_update_v20 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV20
-from lib.models.cos_update_v21 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV21
-from lib.models.cos_update_v22 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV22
 from lib.models.cos_update_v23 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV23
-from lib.models.cos_update_v24 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV24
-from lib.models.cos_update_v25 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV25
-from lib.models.cos_update_v26 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV26
-from lib.models.cos_update_v27 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV27
-from lib.models.cos_update_v28 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV28
-from lib.models.cos_update_v29 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV29
-from lib.models.cos_update_v30 import TripletMotionConsistencyMotionPairSparseConv as TripletMotionConsistencyMotionPairSparseConvV30
+
 from lib.models.ca import TripletMotionConsistencyMotionPairSparseConv as CrossFrameAttentionSparseConvCA
 # from lib.models.se import SparseSymmetricCosineAttention, SparseSEModule
 
 
 MFE_MODULE_NAMES = (
-    'cosv10', 'cosv11', 'cosv12', 'cosv13', 'frstt',
-    'cosv14', 'ocatf', 'object_token',
-    'cosv15', 'sttm', 'sparse_traj_token',
-    'cosv16', 'tmc', 'tmc_sconv',
-    'cosv17', 'tmc_cos', 'tmc_cos_sconv',
-    'cosv18', 'tmc_motion_pair', 'tmc_motion_pair_sconv',
-    'cosv20', 'tmc_motion_pair_attn', 'tmc_motion_pair_attn_sconv',
-    'cosv21', 'tmc_motion_pair_branch_gate', 'tmc_motion_pair_branch_gate_sconv',
-    'cosv22', 'tmc_motion_pair_repeat', 'tmc_motion_pair_repeat_sconv',
     'cosv23', 'tmc_feature_pair_marginal_attn', 'tmc_feature_pair_marginal_attn_sconv',
-    'cosv24', 'tmc_feature_pair_multidilation_attn', 'tmc_feature_pair_multidilation_attn_sconv',
-    'cosv25', 'tmc_feature_neighbor_attn', 'tmc_feature_neighbor_attn_sconv',
-    'cosv26', 'tmc_neighbor_sa_cross_attn', 'tmc_neighbor_sa_cross_attn_sconv',
-    'cosv27', 'tmc_feature_pair_temp_attn', 'tmc_feature_pair_temp_attn_sconv',
-    'cosv28', 'tmc_feature_pair_bin_attn', 'tmc_feature_pair_bin_attn_sconv',
-    'cosv29', 'tmc_feature_pair_sigmoid_attn', 'tmc_feature_pair_sigmoid_attn_sconv',
-    'cosv30', 'tmc_feature_pair_sigmoid_9d_attn', 'tmc_feature_pair_sigmoid_9d_attn_sconv',
     'ca', 'cross_frame_attn', 'cross_frame_attn_sconv',
 )
 BOTTLE_MFE_WITH_2_BLOCK = 'mfew2block'
@@ -427,17 +393,33 @@ class UNetV2_3_T_nodown_v2(nn.Module):
 
 
     @staticmethod
-    def _snapshot_sparse_tensor(x):
-        spatial_shape = getattr(x, "spatial_shape", None)
+    def _snapshot_sparse_tensor(x, spatial_shape_override=None):
+        spatial_shape = spatial_shape_override
+        if spatial_shape is None:
+            spatial_shape = getattr(x, "spatial_shape", None)
         if spatial_shape is None:
             spatial_shape = []
         spatial_shape = tuple(int(v) for v in list(spatial_shape)[:3])
-        return {
+        snapshot = {
             "features": x.features.detach().float().cpu(),
             "indices": x.indices.detach().int().cpu(),
             "spatial_shape": spatial_shape,
             "batch_size": int(getattr(x, "batch_size", 1)),
         }
+        if spatial_shape_override is not None:
+            snapshot["force_spatial_shape"] = True
+        return snapshot
+
+    @staticmethod
+    def _taa_vis_spatial_shape(x, patch_width=None, skip=1):
+        spatial_shape = getattr(x, "spatial_shape", None)
+        if spatial_shape is None:
+            return None
+        shape = [int(v) for v in list(spatial_shape)[:3]]
+        if patch_width is not None and len(shape) >= 3:
+            scale = {1: 1, 2: 2, 3: 4}.get(int(skip), 1)
+            shape[2] = max((int(patch_width) + scale - 1) // scale, 1)
+        return tuple(shape)
 
     def forward(self, batch_dict):
         """
@@ -456,6 +438,7 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         batch_size = batch_dict['batch_size']
         capture_taa_heatmap = bool(batch_dict.get("capture_taa_heatmap", False)) and self.MFE in MFE_MODULE_NAMES
         taa_skip_features = [] if capture_taa_heatmap else None
+        taa_patch_width = batch_dict.get("taa_patch_width") if capture_taa_heatmap else None
 
         input_sp_tensor = spconv.SparseConvTensor(
             features=voxel_features,
@@ -489,20 +472,21 @@ class UNetV2_3_T_nodown_v2(nn.Module):
             x_bottle = replace_feature(x_bottle, self.x_bottle_enhancement(x_bottle)[0])
             x_bottle = self.x_bottle_up(x_bottle)
         elif not self.bottle_enhancement:
-            x_bottle = spconv.SparseSequential(x_conv3)
+            x_bottle = x_conv3
 
         # ------------------------------------------------------------------
         # Decoder
         # x_conv3 is the deepest skip and x_bottle is the bottom branch.
         # ------------------------------------------------------------------
         if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[2]:
-            taa_before = self._snapshot_sparse_tensor(x_conv3) if taa_skip_features is not None else None
+            taa_shape3 = self._taa_vis_spatial_shape(x_conv3, taa_patch_width, skip=3) if taa_skip_features is not None else None
+            taa_before = self._snapshot_sparse_tensor(x_conv3, taa_shape3) if taa_skip_features is not None else None
             x_conv3 = replace_feature(x_conv3, self.shortcut3(x_conv3)[0])
             if taa_skip_features is not None:
                 taa_skip_features.append({
                     "skip": 3,
                     "before": taa_before,
-                    "after": self._snapshot_sparse_tensor(x_conv3),
+                    "after": self._snapshot_sparse_tensor(x_conv3, taa_shape3),
                 })
             # x_conv3 = self.shortcut3fusion(x_conv3)
 
@@ -515,13 +499,14 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         )
 
         if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[1]:
-            taa_before = self._snapshot_sparse_tensor(x_conv2) if taa_skip_features is not None else None
+            taa_shape2 = self._taa_vis_spatial_shape(x_conv2, taa_patch_width, skip=2) if taa_skip_features is not None else None
+            taa_before = self._snapshot_sparse_tensor(x_conv2, taa_shape2) if taa_skip_features is not None else None
             x_conv2 = replace_feature(x_conv2, self.shortcut2(x_conv2)[0])
             if taa_skip_features is not None:
                 taa_skip_features.append({
                     "skip": 2,
                     "before": taa_before,
-                    "after": self._snapshot_sparse_tensor(x_conv2),
+                    "after": self._snapshot_sparse_tensor(x_conv2, taa_shape2),
                 })
             # x_conv2 = self.shortcut2fusion(x_conv2)
 
@@ -534,13 +519,14 @@ class UNetV2_3_T_nodown_v2(nn.Module):
         )
 
         if self.MFE in MFE_MODULE_NAMES and self.mfe_skip[0]:
-            taa_before = self._snapshot_sparse_tensor(x_conv1) if taa_skip_features is not None else None
+            taa_shape1 = self._taa_vis_spatial_shape(x_conv1, taa_patch_width, skip=1) if taa_skip_features is not None else None
+            taa_before = self._snapshot_sparse_tensor(x_conv1, taa_shape1) if taa_skip_features is not None else None
             x_conv1 = replace_feature(x_conv1, self.shortcut1(x_conv1)[0])
             if taa_skip_features is not None:
                 taa_skip_features.append({
                     "skip": 1,
                     "before": taa_before,
-                    "after": self._snapshot_sparse_tensor(x_conv1),
+                    "after": self._snapshot_sparse_tensor(x_conv1, taa_shape1),
                 })
             # x_conv1 = self.shortcut1fusion(x_conv1)
 

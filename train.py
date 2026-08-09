@@ -26,7 +26,6 @@ from lib.models.stNet import get_det_net,load_model, save_model
 from lib.dataset.dataset_factory import get_dataset
 from lib.Trainer.trainer_factory import get_trainer
 
-from lib.LRSD.filter_lrsd import generate_labels
 
 def main(opt):
     torch.manual_seed(opt.seed)
@@ -49,7 +48,8 @@ def main(opt):
         os.mkdir(opt.save_dir)
     opt.save_results_dir  = opt.save_dir
 
-    model_path_name = opt.exp_name +'_supMode_%d' % opt.sup_mode + '_seglen%d_' % opt.seqLen + 'weights' + time_str
+    # model_path_name = opt.exp_name +'_supMode_%d' % opt.sup_mode + '_seglen%d_' % opt.seqLen + 'weights' + time_str # for SGNet
+    model_path_name = opt.exp_name + '_seglen%d_' % opt.seqLen + time_str
 
     opt.save_dir = opt.save_dir + '/'+model_path_name
     opt.save_log_dir = opt.save_dir
@@ -171,10 +171,10 @@ def main(opt):
 
     for epoch in range(start_epoch + 1, opt.num_epochs + 1):
 
-        if opt.sup_mode==3 and epoch == 1 :
-            print('generate labels!!!')
-            generate_labels(opt.data_dir,phase='train') # opt.data_dir='/root/autodl-tmp//AircraftDataset23/
-            print('generate labels done!!!')
+        # if opt.sup_mode==3 and epoch == 1 :
+        #     print('generate labels!!!')
+        #     generate_labels(opt.data_dir,phase='train') # opt.data_dir='/root/autodl-tmp//AircraftDataset23/
+        #     print('generate labels done!!!')
 
         log_dict_train, _ = trainer.train(epoch, train_loader)
 
@@ -184,12 +184,12 @@ def main(opt):
         model_save_path = os.path.join(opt.save_dir, 'model_last.pth')
         save_model(model_save_path, epoch, model, optimizer)
 
-        if epoch%opt.unsup_iter==0 and opt.sup_mode==3:
-            trainer.update_label(epoch, val_loader, base_s, DataVal, model_save_path)
+        # if epoch%opt.unsup_iter==0 and opt.sup_mode==3:
+        #     trainer.update_label(epoch, val_loader, base_s, DataVal, model_save_path)
 
         for k, v in log_dict_train.items():
             logger.write('{} {:8f} | '.format(k, v))
-        if val_intervals > 0 and epoch % val_intervals == 0 and epoch > 15:
+        if val_intervals > 0 and epoch % val_intervals == 0 and epoch > 10:
 
             save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)), epoch, model, optimizer)
             with torch.no_grad():
@@ -197,13 +197,8 @@ def main(opt):
             logger.write('eval results: ')
             for k, v in log_dict_val.items():
                 logger.write('{} {:8f} | '.format(k, v))
-            f1_mode = opt.metric['f1_mode'] # ['iou', 'dis']
-            if 'dis' in f1_mode:
-                eval_mode_metric = 'dis_f1_best'
-            elif 'iou' in f1_mode:
-                eval_mode_metric = 'iou_f1_best'
-            else:
-                eval_mode_metric = 'ap'
+            # 由 metric 显式指定 best 依据，例如 ap50 / real_ap50 / iou_f1_best。
+            eval_mode_metric = opt.metric.get('best_metric', 'ap50')
             if log_dict_val[eval_mode_metric] > best:
                 best = log_dict_val[eval_mode_metric]
                 save_model(os.path.join(opt.save_dir, f'model_best_{eval_mode_metric}.pth'),

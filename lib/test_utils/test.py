@@ -5,6 +5,7 @@ from __future__ import print_function
 from lib.models.stNet import get_det_net, load_model, save_model
 from lib.dataset.dataset_factory import get_dataset
 from lib.utils_eval.evaluation_final_func import eval_func_final
+from lib.utils_eval.evaluation_coco_json_func import eval_coco_json_f1
 from lib.utils_eval.evaluation_net1_point import eval_net1_points
 from lib.test_utils.show_imgs import *
 from lib.test_utils.process_img_dets import *
@@ -13,6 +14,20 @@ from lib.utils1.save_img import save_net1_output
 import GPUtil
 import scipy.io as scio
 import gc
+
+COCO_STAT_NAMES = [
+    'ap', 'ap50', 'ap75', 'ap_small', 'ap_medium', 'ap_large',
+    'ar_max1', 'ar_max10', 'ar_max100', 'ar_small', 'ar_medium', 'ar_large'
+]
+
+def _add_coco_stats(results_return, split_name, stats):
+    # COCOeval.summarize() 的 12 项原样展开保存，便于实验日志检索。
+    prefix = 'all' if split_name == 'all' else split_name
+    for stat_name, value in zip(COCO_STAT_NAMES, stats):
+        results_return[f'{prefix}_coco_{stat_name}'] = float(value)
+    if split_name == 'all':
+        results_return['ap50'] = float(stats[1])
+
 def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3, DataVal=None):
     test_net1 = False # 生成坐标txt
     run_eval_net1 = False # 计算坐标与bbox的recall和iou覆盖率
@@ -21,7 +36,10 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
     save_json = opt.metric['save_json']
     save_mat = opt.metric['save_mat']
     f1_mode = opt.metric['f1_mode'] # ['iou', 'dis']
+    f1_source = opt.metric.get('f1_source', 'json')
+    eval_splits = opt.metric.get('eval_splits', ['all'])
     inference = opt.metric['inference']
+    need_result_json = save_json or run_ap or (run_f1 and f1_source == 'json')
     # save_mat = False
     xmlname = opt.xmlname # 'xml_det' # xml1new # xml_det 
 
@@ -35,15 +53,17 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
     # dataset = get_dataset(opt)
 
     # DataVal = dataset(opt, split)
-    if opt.off_flag:
-        head = {'hm': DataVal.num_classes, 'wh': 2, 'reg': 2}
-    else:
-        head = {'hm': DataVal.num_classes, 'wh': 2}
-    model = get_det_net(head, opt.model_name, DataVal.resolution, opt.seqLen, opt, thresh=i_th)  # 建立模型 model的resolution变了
-    model = load_model(model, modelPath)
     model_end_name = modelPath.split('/')[-1].split('.')[0]
-    model = model.to(opt.device)
-    model.eval()
+    model = None
+    if inference:
+        if opt.off_flag:
+            head = {'hm': DataVal.num_classes, 'wh': 2, 'reg': 2}
+        else:
+            head = {'hm': DataVal.num_classes, 'wh': 2}
+        model = get_det_net(head, opt.model_name, DataVal.resolution, opt.seqLen, opt, thresh=i_th)  # 建立模型 model的resolution变了
+        model = load_model(model, modelPath)
+        model = model.to(opt.device)
+        model.eval()
 
 
     return_time = True
@@ -51,12 +71,12 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
     num_classes = DataVal.num_classes
     max_per_image = opt.K
 
+    # 评估结果统一放在 results_dir；mat 只作为可选兼容产物。
+    save_mat_path_upper = os.path.join(opt.save_results_dir, results_name)
+    os.makedirs(save_mat_path_upper, exist_ok=True)
+    result_json_path = os.path.join(save_mat_path_upper, 'results_{}.json'.format(model_end_name))
     if save_mat:
-        save_mat_path_upper = os.path.join(opt.save_results_dir, results_name)
-        #
-        if not os.path.exists(save_mat_path_upper):
-            os.mkdir(save_mat_path_upper)
-            print(f'mkdirs:{save_mat_path_upper}')
+        print(f'mkdirs:{save_mat_path_upper}')
 
     # ── 特征图可视化：创建目录并实例化 hook 管理器 ──────────────────────────
     vis_features = getattr(opt, 'vis_features', False)
@@ -112,7 +132,7 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
     results_return = {} # 写txt结果
     component_stats = {}
     image_id_map = None
-    if save_json and hasattr(DataVal, 'coco'):
+    if need_result_json and hasattr(DataVal, 'coco'):
         image_id_map = {}
         for image_info in DataVal.coco.dataset.get('images', []):
             ann_rel_path = image_info.get('file_name', '').replace('\\', '/').lstrip('./')
@@ -202,7 +222,7 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
                 forward_elapsed = forward_time - time_start1
                 time_all.append(forward_elapsed)
                 preprocess_time_all.append((time_start1 - time_start0))
-                if save_json:
+                if need_result_json:
                     for im_id_i, ret in enumerate(rets):
                         img_rel_path = os.path.relpath(
                             patch_ims_path[im_id_i], test_upper_path).replace(os.sep, '/')
@@ -369,79 +389,121 @@ def test(opt, split, modelPath, show_flag, results_name, save_mat=False, i_th=3,
             average_sampling_rate = total_sampling_rate / num_batches
             print(f"整个测试集的平均采样率: {average_sampling_rate * 100:.5f}%")
             results_return['average_sampling_rate'] = average_sampling_rate * 100
+        if need_result_json and results:
+            DataVal.save_results(results, save_mat_path_upper, model_end_name)
     else:
-        if run_ap and inference and results=={}:
-            print("未完整推理但是需要测评ap，尝试主动加载results,请检查！")
-            results = DataVal.coco.loadRes('{}/results_{}.json'.format(save_mat_path_upper, model_end_name))
+        # 不推理时，AP 和 json-F1 均复用已有 COCO 预测 json。
+        if (run_ap or (run_f1 and f1_source == 'json')) and not os.path.exists(result_json_path):
+            raise FileNotFoundError(result_json_path)
 
 
     if run_ap:
-        if inference:
-            if results:
+        results_return['time'] = 1 / 60.
+        if hasattr(DataVal, 'run_eval_splits'):
+            split_stats = DataVal.run_eval_splits(result_json_path, eval_splits)
+            for split_name, stats in split_stats.items():
+                _add_coco_stats(results_return, split_name, stats)
+        else:
+            if eval_splits != ['all']:
+                raise Exception('This dataset does not support sim/real AP splits.')
+            if inference:
                 stats1, _ = DataVal.run_eval(results, save_mat_path_upper, model_end_name)
             else:
-                print(f"results:{results},未执行run_ap")
-                stats1 = {1: 0}
-        else:
-            stats1, _ = DataVal.run_eval_just(save_mat_path_upper, model_end_name) # 不进行results保存
-        results_return['time'] = 1 / 60.
-        results_return['ap50'] = stats1[1]
+                stats1, _ = DataVal.run_eval_just(save_mat_path_upper, 'results_{}.json'.format(model_end_name), 0.5)
+            _add_coco_stats(results_return, 'all', stats1)
+
     if run_f1:
-        for eval_mode_metric in f1_mode:
-            conf_results = eval_func_final([os.path.join(opt.save_results_dir, results_name + '/')], data_dir=test_upper_path, opt=opt,
-                                        eval_mode_metric=eval_mode_metric,xmlname=xmlname)
-            best = -1
-            for conf, v_c in conf_results.items():
-                for k_m, v_m in v_c.items():
-                    for k_d, v_d in v_m.items():
+        if f1_source == 'json':
+            conf_results = eval_coco_json_f1(
+                DataVal.coco, result_json_path, save_mat_path_upper,
+                f1_mode=f1_mode, eval_splits=eval_splits, opt=opt,
+                data_dir=test_upper_path, xmlname=xmlname)
+            for eval_mode_metric, mode_results in conf_results.items():
+                best_by_split = {split_name: -1 for split_name in eval_splits}
+                for conf, split_results in mode_results.items():
+                    for split_name, v_d in split_results.items():
                         re = v_d['avg']['recall']
                         pre = v_d['avg']['prec']
                         f1 = v_d['avg']['f1']
-                        results_return[f'{eval_mode_metric}_conf_%.2f'%conf + '_avg_recall'] = re
-                        results_return[f'{eval_mode_metric}_conf_%.2f' % conf + '_avg_prec'] = pre
-                        results_return[f'{eval_mode_metric}_conf_%.2f' % conf + '_avg_f1'] = f1
-                        if best < f1:
-                            best = f1
-            results_return[f'{eval_mode_metric}_f1_best'] = best
+                        prefix = '' if split_name == 'all' else f'{split_name}_'
+                        results_return[f'{prefix}{eval_mode_metric}_conf_%.2f' % conf + '_avg_recall'] = re
+                        results_return[f'{prefix}{eval_mode_metric}_conf_%.2f' % conf + '_avg_prec'] = pre
+                        results_return[f'{prefix}{eval_mode_metric}_conf_%.2f' % conf + '_avg_f1'] = f1
+                        if split_name == 'all':
+                            results_return[f'all_{eval_mode_metric}_conf_%.2f' % conf + '_avg_recall'] = re
+                            results_return[f'all_{eval_mode_metric}_conf_%.2f' % conf + '_avg_prec'] = pre
+                            results_return[f'all_{eval_mode_metric}_conf_%.2f' % conf + '_avg_f1'] = f1
+                        if best_by_split[split_name] < f1:
+                            best_by_split[split_name] = f1
+                for split_name, best in best_by_split.items():
+                    if split_name == 'all':
+                        results_return[f'{eval_mode_metric}_f1_best'] = best
+                        results_return[f'all_{eval_mode_metric}_f1_best'] = best
+                    else:
+                        results_return[f'{split_name}_{eval_mode_metric}_f1_best'] = best
+        elif f1_source == 'mat':
+            if eval_splits != ['all']:
+                raise Exception('mat f1_source only supports all split.')
+            for eval_mode_metric in f1_mode:
+                conf_results = eval_func_final([os.path.join(opt.save_results_dir, results_name + '/')], data_dir=test_upper_path, opt=opt,
+                                            eval_mode_metric=eval_mode_metric,xmlname=xmlname)
+                best = -1
+                for conf, v_c in conf_results.items():
+                    for k_m, v_m in v_c.items():
+                        for k_d, v_d in v_m.items():
+                            re = v_d['avg']['recall']
+                            pre = v_d['avg']['prec']
+                            f1 = v_d['avg']['f1']
+                            results_return[f'{eval_mode_metric}_conf_%.2f'%conf + '_avg_recall'] = re
+                            results_return[f'{eval_mode_metric}_conf_%.2f' % conf + '_avg_prec'] = pre
+                            results_return[f'{eval_mode_metric}_conf_%.2f' % conf + '_avg_f1'] = f1
+                            if best < f1:
+                                best = f1
+                results_return[f'{eval_mode_metric}_f1_best'] = best
+        else:
+            raise Exception('Not a valid f1_source!!')
 
-        if run_ap or run_f1:
-            results_tol_txt = os.path.join(opt.save_results_dir, results_name, 'results_tol.txt')
-            results_tol_txt_fid = open(results_tol_txt, 'w+')
-            results_tol_txt_fid.write(results_name+'\n')
-            for k,v in results_return.items():
-                results_tol_txt_fid.write(k+': %.4f\n'%v)
-                # 简化判断：通过键名后缀判断是否为f1_best键
-                if k.endswith('_f1_best'):
-                    results_tol_txt_fid.write('\n')  # 写入空行
-            results_tol_txt_fid.close()
-            time_txt = open(os.path.join(opt.save_results_dir, results_name, 'time.txt'),'w')
-            if inference:
-                time_txt.write('forward_time_mean: %.4f\t forward frames per second: %.2f\n'%(time_mean/patch_len, 1/time_mean*patch_len))
-                time_txt.write('total_preprocess_time_mean: %.4f\t preprocess frames per second: %.2f\n'%(time_preprocess_mean/patch_len, 1/time_preprocess_mean*patch_len))
-                if component_stats:
-                    time_txt.write('===== Five-Stage Component Profiling =====\n')
-                    component_order = getattr(model, 'runtime_component_names', ())
-                    for component_name in component_order:
-                        stats_dict = component_stats[component_name]
-                        display_name = stats_dict.get('display_name', component_name)
-                        time_txt.write(
-                            f"{display_name}: runtime={stats_dict['runtime']:.6f}s, "
-                            f"runtime_percent={stats_dict['runtime_percent']:.2f}%, "
-                            f"Params={stats_dict['params']}, GFLOPS={stats_dict['gflops']:.6f}\n"
-                        )
-                    total_stats = component_stats.get('Total')
-                    if total_stats is not None:
-                        time_txt.write(
-                            f"Total: runtime={total_stats['runtime']:.6f}s, "
-                            f"runtime_percent={total_stats['runtime_percent']:.2f}%, "
-                            f"Params={total_stats['params']}, GFLOPS={total_stats['gflops']:.6f}\n"
-                        )
-                    time_txt.write('=========================================\n')
-            time_txt.close()
-        del model, conf_results
-        gc.collect()
-        plt.close('all') # 强制关闭所有 figure，防止残留
-        torch.cuda.empty_cache() # 清理 GPU 临时显存
+    if run_ap or run_f1:
+        results_tol_txt = os.path.join(opt.save_results_dir, results_name, 'results_tol.txt')
+        results_tol_txt_fid = open(results_tol_txt, 'w+')
+        results_tol_txt_fid.write(results_name+'\n')
+        for k, v in results_return.items():
+            results_tol_txt_fid.write(k+': %.5f\n' % v)
+            # F1 最优值后空一行，方便人眼区分不同指标组。
+            if k.endswith('_f1_best'):
+                results_tol_txt_fid.write('\n')
+        results_tol_txt_fid.close()
+
+        time_txt = open(os.path.join(opt.save_results_dir, results_name, 'time.txt'), 'w')
+        if inference:
+            time_txt.write('forward_time_mean: %.4f\t forward frames per second: %.2f\n' % (time_mean/patch_len, 1/time_mean*patch_len))
+            time_txt.write('total_preprocess_time_mean: %.4f\t preprocess frames per second: %.2f\n' % (time_preprocess_mean/patch_len, 1/time_preprocess_mean*patch_len))
+            if component_stats:
+                time_txt.write('===== Five-Stage Component Profiling =====\n')
+                component_order = getattr(model, 'runtime_component_names', ())
+                for component_name in component_order:
+                    stats_dict = component_stats[component_name]
+                    display_name = stats_dict.get('display_name', component_name)
+                    time_txt.write(
+                        f"{display_name}: runtime={stats_dict['runtime']:.6f}s, "
+                        f"runtime_percent={stats_dict['runtime_percent']:.2f}%, "
+                        f"Params={stats_dict['params']}, GFLOPS={stats_dict['gflops']:.6f}\n"
+                    )
+                total_stats = component_stats.get('Total')
+                if total_stats is not None:
+                    time_txt.write(
+                        f"Total: runtime={total_stats['runtime']:.6f}s, "
+                        f"runtime_percent={total_stats['runtime_percent']:.2f}%, "
+                        f"Params={total_stats['params']}, GFLOPS={total_stats['gflops']:.6f}\n"
+                    )
+                time_txt.write('=========================================\n')
+        time_txt.close()
+
+    if model is not None:
+        del model
+    gc.collect()
+    plt.close('all') # 强制关闭所有 figure，防止残留
+    torch.cuda.empty_cache() # 清理 GPU 临时显存
     if run_eval_net1:
         eval_net1_points([os.path.join(opt.save_results_dir, results_name + '/')],data_dir=test_upper_path,xmlname=xmlname)
     return results_return

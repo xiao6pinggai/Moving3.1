@@ -11,12 +11,27 @@ cd "$(dirname "$0")"
 #   --model_name I2PSOD\
 #   --datasetname sdm_car \
 
-echo "[$(date '+%F %T')] Start: xrsy_Net1_Net2"
+# echo "[$(date '+%F %T')] Start: xrsy_Net1_Net2"
+# python train.py \
+#   --discribe xrsy_Net1_Net2 \
+#   --exp_name xrsy_Net1_Net2 \
+#   --model_name Net1_Net2\
+#   --datasetname sdm_car \
+
+echo "[$(date '+%F %T')] Start: xrsy_retopk111"
 python train.py \
-  --discribe xrsy_Net1_Net2 \
-  --exp_name xrsy_Net1_Net2 \
-  --model_name Net1_Net2\
+  --discribe xrsy_retopk111 \
+  --exp_name xrsy_retopk111 \
+  --model_name I2PSOD \
   --datasetname sdm_car \
+  --MFE cosv23 \
+  --tmc_topk [1,1,1]
+
+python test.py \
+  --load_model weights/sdm_car_multi/I2PSOD/xrsy_retopk111_supMode_0_seglen10_weights2026_07_31_00_18_50/model_best_dis_f1_best.pth \
+  --model_name I2PSOD \
+  --tmc_topk [1,1,1] \
+  --datasetname sdm_car 
 
 echo "[$(date '+%F %T')] Start: xrsy_CA"
 python train.py \

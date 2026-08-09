@@ -7,6 +7,8 @@ from pycocotools.cocoeval import COCOeval
 import numpy as np
 import json
 import os
+import io
+import contextlib
 
 import torch.utils.data as data
 import numpy as np
@@ -25,6 +27,31 @@ from lib.utils1.augmentations import Augmentation
 
 import torch.utils.data as data
 from collections import defaultdict
+
+
+COCO_SUMMARY_LINES = [
+    ('Average Precision', 'AP', 'IoU=0.50:0.95', 'all', 100),
+    ('Average Precision', 'AP', 'IoU=0.50     ', 'all', 100),
+    ('Average Precision', 'AP', 'IoU=0.75     ', 'all', 100),
+    ('Average Precision', 'AP', 'IoU=0.50:0.95', 'small', 100),
+    ('Average Precision', 'AP', 'IoU=0.50:0.95', 'medium', 100),
+    ('Average Precision', 'AP', 'IoU=0.50:0.95', 'large', 100),
+    ('Average Recall', 'AR', 'IoU=0.50:0.95', 'all', 1),
+    ('Average Recall', 'AR', 'IoU=0.50:0.95', 'all', 10),
+    ('Average Recall', 'AR', 'IoU=0.50:0.95', 'all', 100),
+    ('Average Recall', 'AR', 'IoU=0.50:0.95', 'small', 100),
+    ('Average Recall', 'AR', 'IoU=0.50:0.95', 'medium', 100),
+    ('Average Recall', 'AR', 'IoU=0.50:0.95', 'large', 100),
+]
+
+
+def summarize_coco_eval_5dec(coco_eval):
+    # pycocotools 原 summarize 写死 3 位小数；这里保留 stats 计算，改为 5 位打印。
+    with contextlib.redirect_stdout(io.StringIO()):
+        coco_eval.summarize()
+    for value, (title, short_name, iou, area, max_dets) in zip(coco_eval.stats, COCO_SUMMARY_LINES):
+        print(' {:<18} ({}) @[ {} | area={:>6} | maxDets={:>3d} ] = {:.5f}'.format(
+            title, short_name, iou, area, max_dets, value))
 
 
 class COCO_aircraft(data.Dataset):
@@ -93,7 +120,8 @@ class COCO_aircraft(data.Dataset):
             self.aug = None
 
     def _to_float(self, x):
-        return float("{:.2f}".format(x))
+        # json 同时用于 AP 和固定阈值 F1，保留原始精度避免阈值附近被四舍五入改变。
+        return float(x)
 
     # 遍历每一个标注文件解析写入detections. 输出结果使用
     def convert_eval_format(self, all_bboxes):
@@ -115,7 +143,7 @@ class COCO_aircraft(data.Dataset):
                         "image_id": int(image_id),
                         "category_id": int(category_id),
                         "bbox": bbox_out,
-                        "score": float("{:.2f}".format(score))
+                        "score": float(score)
                     }
                     if len(bbox) > 5:
                         extreme_points = list(map(self._to_float, bbox[5:13]))
@@ -138,18 +166,53 @@ class COCO_aircraft(data.Dataset):
         coco_eval = COCOeval(self.coco, coco_dets, "bbox")
         coco_eval.evaluate()
         coco_eval.accumulate()
-        coco_eval.summarize()
+        summarize_coco_eval_5dec(coco_eval)
         stats = coco_eval.stats
         precisions = coco_eval.eval['precision']
 
         return stats, precisions
+
+    def _get_eval_split_img_ids(self, eval_splits):
+        all_img_ids = sorted([int(image_id) for image_id in self.images])
+        split_img_ids = {'all': all_img_ids}
+        if 'sim' in eval_splits or 'real' in eval_splits:
+            real_img_ids, sim_img_ids = [], []
+            for image_info in self.coco.dataset['images']:
+                file_name = image_info.get('file_name', '').replace('\\', '/').lstrip('./')
+                for prefix in ('images/test/', 'images/test1024/'):
+                    if file_name.startswith(prefix):
+                        file_name = file_name[len(prefix):]
+                        break
+                video_name = file_name.split('/')[0]
+                if video_name.startswith('realobject'):
+                    real_img_ids.append(int(image_info['id']))
+                else:
+                    sim_img_ids.append(int(image_info['id']))
+            split_img_ids['sim'] = sorted(sim_img_ids)
+            split_img_ids['real'] = sorted(real_img_ids)
+        return split_img_ids
+
+    def run_eval_splits(self, result_json_path, eval_splits):
+        # 按 all/sim/real 分组运行 COCOeval；不修改预测 json。
+        coco_dets = self.coco.loadRes(result_json_path)
+        split_img_ids = self._get_eval_split_img_ids(eval_splits)
+        split_stats = {}
+        for split_name in eval_splits:
+            coco_eval = COCOeval(self.coco, coco_dets, "bbox")
+            coco_eval.params.imgIds = split_img_ids[split_name]
+            coco_eval.evaluate()
+            coco_eval.accumulate()
+            summarize_coco_eval_5dec(coco_eval)
+            split_stats[split_name] = coco_eval.stats
+            print('%s ap50: %.5f' % (split_name, coco_eval.stats[1]))
+        return split_stats
 
     def run_eval_just(self, save_dir, time_str, iouth):
         coco_dets = self.coco.loadRes('{}/{}'.format(save_dir, time_str))
         coco_eval = COCOeval(self.coco, coco_dets, "bbox", iouth = iouth)
         coco_eval.evaluate()
         coco_eval.accumulate()
-        coco_eval.summarize()
+        summarize_coco_eval_5dec(coco_eval)
         stats_5 = coco_eval.stats
         precisions = coco_eval.eval['precision']
 

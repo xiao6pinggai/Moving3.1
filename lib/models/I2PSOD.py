@@ -172,10 +172,110 @@ class Img2PointsSmallObjectDetection(nn.Module):
         binary_mask = binary_mask_flat.view(B, 1, T, H, W)
         return binary_mask
 
+
+    def forward_patch(self, batch, max_patch_w):
+        device = batch["input"].device
+        b, c, t, h, w = batch["input"].shape
+
+        def run_patch(patch_batch, patch_w):
+            b, c, t, h, w = patch_batch["input"].shape
+            net1_output = self.I2PNet(patch_batch["input"])
+
+            if net1_output.shape[1] > 1:
+                voxel_score_logits = net1_output.mean(dim=1, keepdim=True)
+            else:
+                voxel_score_logits = net1_output
+
+            soft_mask = self.sigmoid(voxel_score_logits)
+            binary_mask = self.get_mask_by_mean_std(
+                soft_mask=soft_mask,
+                var_coeff=self.thresh,
+            )
+
+            coords = torch.nonzero(binary_mask.squeeze(1)).contiguous()
+            total_points = b * t * h * w
+            sampled_points = coords.shape[0]
+            sampling_rate = sampled_points / total_points if total_points > 0 else 0
+
+            batch_idx = coords[:, 0]
+            t_idx = coords[:, 1]
+            h_idx = coords[:, 2]
+            w_idx = coords[:, 3]
+            flattened_indices = batch_idx * t * h * w + t_idx * h * w + h_idx * w + w_idx
+
+            batch_dict = {}
+            voxel_feature_channels = net1_output.shape[1]
+            voxel_features_flat = net1_output.permute(0, 2, 3, 4, 1).reshape(b * t * h * w, voxel_feature_channels)
+            batch_dict["voxel_features"] = voxel_features_flat[flattened_indices]
+            batch_dict["voxel_coords"] = coords.to(device)
+            batch_dict["batch_size"] = b
+            if coords.shape[0] == 0:
+                print("Warning: No points generated from I2PNet!")
+            if batch_dict["voxel_features"].shape[0] == 0:
+                print("Warning: No voxel features selected for SPConvNet!")
+
+            sp_backbone_out = self.sp_backbone(batch_dict)
+            z = {}
+            input_sp_tensor = sp_backbone_out["encoded_spconv_tensor"]
+            for head in self.heads:
+                out_h = self.__getattr__(head)(input_sp_tensor)
+
+                if "hm" in head:
+                    out_h = replace_feature(out_h, self.sigmoid(out_h.features))
+                    spatial_features = out_h.dense()
+                    spatial_features = torch.clamp(spatial_features, min=1e-4, max=1 - 1e-4)
+                else:
+                    spatial_features = out_h.dense()
+                z[head] = spatial_features[..., :patch_w]
+
+            z["hm_large_heatmap"] = net1_output
+            z["voxel_coords"] = batch_dict["voxel_coords"]
+            z["soft_mask"] = soft_mask
+            z["sampling_rate"] = torch.tensor(sampling_rate, device=device)
+            return z
+
+        if w <= max_patch_w:
+            with torch.no_grad():
+                return [run_patch(batch, w)]
+
+        z_parts = []
+        offsets = []
+        for start in range(0, w, max_patch_w):
+            end = min(start + max_patch_w, w)
+            patch_batch = {**batch, "input": batch["input"][..., start:end]}
+            with torch.no_grad():
+                z_parts.append(run_patch(patch_batch, end - start))
+            offsets.append(start)
+            del patch_batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        z_merged = {}
+        for head in self.heads:
+            z_merged[head] = torch.cat([z[head] for z in z_parts], dim=-1)
+        z_merged["hm_large_heatmap"] = torch.cat([z["hm_large_heatmap"] for z in z_parts], dim=-1)
+        z_merged["soft_mask"] = torch.cat([z["soft_mask"] for z in z_parts], dim=-1)
+
+        coords_parts = []
+        for z, offset in zip(z_parts, offsets):
+            coords = z["voxel_coords"].clone()
+            coords[:, 3] += offset
+            coords_parts.append(coords)
+        z_merged["voxel_coords"] = torch.cat(coords_parts, dim=0)
+
+        total_points = b * t * h * w
+        sampled_points = z_merged["voxel_coords"].shape[0]
+        sampling_rate = sampled_points / total_points if total_points > 0 else 0
+        z_merged["sampling_rate"] = torch.tensor(sampling_rate, device=device)
+        return [z_merged]
+
     def forward(self, batch):
         device = batch['input'].device
         b, c, t, h, w = batch['input'].shape
         
+        if not self.training and False:
+            max_patch_w = 512
+            return self.forward_patch(batch, max_patch_w=max_patch_w)
         net1_output = self.I2PNet(batch['input'])  # B 3 T H W --> B C T H W
         # 注意：不使用 EncoderOnlyConv3DProposalNet，其 forward 返回 dict 而非 tensor
 
