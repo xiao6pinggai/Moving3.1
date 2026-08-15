@@ -10,6 +10,11 @@ from datetime import datetime
 import platform  # 导入系统识别模块
 
 
+def _parse_3d_kernel_list(value):
+    if isinstance(value, list):
+        return value
+    return ast.literal_eval(value)
+
 def _parse_int_list(value):
     if isinstance(value, list):
         tokens = value
@@ -68,6 +73,7 @@ class opts(object):
                                                                 'f1_source':'json', 'f1_mode':['iou'],
                                                                 'eval_splits':['all','real','sim'], 'best_metric':'ap50'},
                                  help='how to test')
+        self.parser.add_argument('--run_test_after_train', action='store_true', help='run test.py with the current best checkpoint after training')
 
         # save
         self.parser.add_argument('--save_dir', type=str, default='./weights',
@@ -112,8 +118,17 @@ class opts(object):
         self.parser.add_argument('--upsample_mode', type=str, default='deconv', help='upsample mode "deconv" or "trilinear"')
         self.parser.add_argument('--Snack_skip', type=_parse_int_list, default=[1,1,1], help='temporal snake conv switches for [skip1, skip2, skip3], e.g. [1,0,1]')
         self.parser.add_argument('--Snack_max_offset', type=_parse_int_list, default=[10,10,10], help='max single-step temporal snake offset scope for [skip1, skip2, skip3]')
+        self.parser.add_argument('--Snack_repeat', type=int, default=1, help='number of sequential Snack blocks per enabled skip; 1 keeps the original single Snack')
+        self.parser.add_argument('--TKernel', type=_parse_3d_kernel_list, default=[[5,1,1],[5,1,1],[5,1,1]], help='legacy 3D kernel sizes for [skip1, skip2, skip3]')
+        self.parser.add_argument('--OffsetKernel', type=_parse_3d_kernel_list, default=[[5,1,1],[5,1,1],[5,1,1]], help='offset-generator kernels for [skip1, skip2, skip3]')
+        self.parser.add_argument('--VSnack_residual', type=int, default=1, choices=[0,1], help='use unconstrained residual increments in v_snack: 1 enables, 0 uses velocity-only offsets')
         self.parser.add_argument('--TZSConv_skip', type=_parse_int_list, default=[0,0,0], help='temporal zero-sum conv switches before UNet3D skip blocks for [skip1, skip2, skip3]')
-        self.parser.add_argument('--UNet3D_skip', type=str, default='snack', choices=['snack', 'tconv', 'tdcn'], help='UNet3D skip block type: snack for temporal snake conv, tconv for temporal Conv3d, tdcn for temporal deform Conv3d')
+        self.parser.add_argument('--Skip_TMixer', type=_parse_int_list, default=[0,0,0], help='temporal mixer switches after Snack_skip for [skip1, skip2, skip3]')
+        self.parser.add_argument('--TMixer_skip', type=str, default='TMixer', choices=['TMixer', 'TMixer_attn', 'TMixer_ca', 'Multi_TMixer', 'Multi_TConv', 'Multi_TConv_LinearTT', 'TMixer_GL', 'TMixer_GLinear_Ldpconv', 'TMixer_GL_group2', 'TMixer_GL_groupT', 'TMixer_GL_Dilation1234', 'TMixer_GL_BNRelu', 'TMixer_GL_test', 'TMixer_Lonly', 'TMixer_STP'], help='temporal mixer type: TMixer uses TPro-style multi-head temporal projections, TMixer_attn uses pointwise temporal self-attention, TMixer_ca uses global-temporal cross-attention at each point, Multi_TMixer fuses global and stride-two temporal mixing, Multi_TConv fuses parallel temporal convolutions with SE, Multi_TConv_LinearTT applies channel-shuffle grouped temporal convolutions then BN+ReLU+Linear(T,T), TMixer_GL fuses Linear(T,T) global mixing with grouped k=1/3/5/7 local temporal convolutions, TMixer_GLinear_Ldpconv adds depthwise spatial 3x3 evidence to global Linear(T,T), TMixer_GL_group2 splits channels between Linear(T,T) and frame-local Linear(1,1) then fuses them; TMixer_GL_groupT uses configurable grouped local kernels with remainder channels assigned to the first group; TMixer_GL_Dilation1234 uses grouped k=3 temporal convolutions with dilation 1,2,3,4; TMixer_GL_BNRelu adds output BN+ReLU to the no-pre-group-shuffle GL mixer, TMixer_GL_test is the no-pre-group-shuffle global-local mixer, TMixer_Lonly keeps only the grouped local temporal pyramid, TMixer_STP fuses symmetric grouped spatial and temporal k=1/3/5/7 convolution pyramids')
+        self.parser.add_argument('--TMixer_groupT_kernels', type=_parse_int_list, default=[1,3,5,7], help='local temporal kernels for TMixer_GL_groupT and Multi_TConv, e.g. [1,3,5]')
+        self.parser.add_argument('--TMixer_num_heads', type=int, default=8, help='number of temporal projection heads used when TMixer_skip=TMixer')
+        self.parser.add_argument('--GD_skip', type=_parse_int_list, default=[0,0,0], help='grouped spatial dilated-convolution switches after TMixer for [skip1, skip2, skip3]')
+        self.parser.add_argument('--UNet3D_skip', type=str, default='snack', choices=['snack', 'snack_unrest', 'v_snack', 'tconv', 'tdcn'], help='UNet3D skip block type: snack for temporal snake conv, snack_unrest for raw-offset temporal snake conv, v_snack for velocity-prior snake conv, tconv for temporal Conv3d, tdcn for temporal deform Conv3d')
 
         """for SGNet"""
         """

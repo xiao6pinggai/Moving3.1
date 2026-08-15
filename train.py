@@ -25,6 +25,19 @@ from datetime import datetime
 from lib.models.stNet import get_det_net,load_model, save_model
 from lib.dataset.dataset_factory import get_dataset
 from lib.Trainer.trainer_factory import get_trainer
+from lib.test_utils.test import test
+
+
+def run_test_after_training(opt, best_checkpoint_path):
+    if not os.path.isfile(best_checkpoint_path):
+        print("Best checkpoint not found; skip post-training test: {}".format(best_checkpoint_path))
+        return
+
+    opt.load_model = best_checkpoint_path
+    opt.save_results_dir = opt.save_dir
+    results_name = "results_{}".format(os.path.splitext(os.path.basename(best_checkpoint_path))[0])
+    print("Running post-training test with {}".format(best_checkpoint_path))
+    test(opt, "test", best_checkpoint_path, opt.show_results, results_name, True)
 
 
 def main(opt):
@@ -189,7 +202,7 @@ def main(opt):
 
         for k, v in log_dict_train.items():
             logger.write('{} {:8f} | '.format(k, v))
-        if val_intervals > 0 and epoch % val_intervals == 0 and epoch > 10:
+        if val_intervals > 0 and epoch % val_intervals == 0 and epoch >= 10:
 
             save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)), epoch, model, optimizer)
             with torch.no_grad():
@@ -213,6 +226,14 @@ def main(opt):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
     logger.close()
+
+    if opt.run_test_after_train:
+        best_metric = opt.metric.get("best_metric", "ap50")
+        best_checkpoint_path = os.path.join(opt.save_dir, "model_best_{}.pth".format(best_metric))
+        del trainer, optimizer, model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        run_test_after_training(opt, best_checkpoint_path)
 
 if __name__ == '__main__':
     opt = opts().parse()

@@ -47,7 +47,7 @@ def get_det_net(heads, model_name, img_size, img_num, opt, thresh=None):
         else:
             model = model_func(heads, **model_kwargs, opt=opt)
     elif model_name == 'UNet3D':
-        model = model_func(heads, input_channels=3, feat_channels=opt.feat_channels, T_pooling=opt.T_pooling, downsample_mode=opt.downsample_mode, upsample_mode=opt.upsample_mode, Snack_skip=opt.Snack_skip, Snack_max_offset=opt.Snack_max_offset, UNet3D_skip=opt.UNet3D_skip, TZSConv_skip=opt.TZSConv_skip)
+        model = model_func(heads, input_channels=3, feat_channels=opt.feat_channels, T_pooling=opt.T_pooling, downsample_mode=opt.downsample_mode, upsample_mode=opt.upsample_mode, Snack_skip=opt.Snack_skip, Snack_max_offset=opt.Snack_max_offset, Snack_repeat=opt.Snack_repeat, TKernel=opt.TKernel, OffsetKernel=opt.OffsetKernel, UNet3D_skip=opt.UNet3D_skip, TZSConv_skip=opt.TZSConv_skip, VSnack_residual=opt.VSnack_residual, Skip_TMixer=opt.Skip_TMixer, TMixer_skip=opt.TMixer_skip, TMixer_num_heads=opt.TMixer_num_heads, TMixer_groupT_kernels=opt.TMixer_groupT_kernels, GD_skip=opt.GD_skip, num_frames=img_num)
     else:
         model = model_func(heads)
     return model

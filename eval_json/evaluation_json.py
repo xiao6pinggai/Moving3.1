@@ -18,7 +18,7 @@ from per_video_coco_eval import run_per_video_coco_eval
 
 
 COCO_STAT_NAMES = [
-    'ap', 'ap50', 'ap75', 'ap_small', 'ap_medium', 'ap_large',
+    'ap', 'ap25', 'ap50', 'ap75', 'ap_small', 'ap_medium', 'ap_large',
     'ar_max1', 'ar_max10', 'ar_max100', 'ar_small', 'ar_medium', 'ar_large'
 ]
 
@@ -90,7 +90,18 @@ def run_coco_eval(coco_gt, pred_json, eval_splits, save_dir, exclude_videos=None
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
-        coco_results[split_name] = coco_eval.stats.copy()
+        # COCOeval's built-in statistics start at IoU=0.50.  Keep that original
+        # evaluation intact and add one independent AP@0.25 value.
+        coco_eval25 = COCOeval(coco_gt, coco_dt, 'bbox')
+        coco_eval25.params.imgIds = split_img_ids[split_name]
+        coco_eval25.params.iouThrs = np.array([0.25])
+        coco_eval25.evaluate()
+        coco_eval25.accumulate()
+        precision25 = coco_eval25.eval['precision'][0, :, 0, 0, -1]
+        valid_precision25 = precision25[precision25 > -1]
+        ap25 = float(np.mean(valid_precision25)) if valid_precision25.size else float('nan')
+        print('AP@0.25 = %.3f' % ap25)
+        coco_results[split_name] = np.insert(coco_eval.stats.copy(), 1, ap25)
 
     path = os.path.join(save_dir, 'coco_results.txt')
     with open(path, 'w') as f:
@@ -398,25 +409,278 @@ def run_json_f1_disp(coco_gt, pred_json, gt_json, mot_json, disp_bins, eval_spli
     return rows
 
 
+
+def bbox_iou_one_to_many(box, boxes):
+    if boxes.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    xx1 = np.maximum(box[0], boxes[:, 0])
+    yy1 = np.maximum(box[1], boxes[:, 1])
+    xx2 = np.minimum(box[2], boxes[:, 2])
+    yy2 = np.minimum(box[3], boxes[:, 3])
+    inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+    area1 = max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+    area2 = np.maximum(0, boxes[:, 2] - boxes[:, 0]) * np.maximum(0, boxes[:, 3] - boxes[:, 1])
+    return inter / np.maximum(area1 + area2 - inter, 1e-12)
+
+
+def voc_ap(rec, prec):
+    if rec.size == 0:
+        return np.nan
+    mrec = np.concatenate(([0.], rec, [1.]))
+    mpre = np.concatenate(([0.], prec, [0.]))
+    for i in range(mpre.size - 2, -1, -1):
+        mpre[i] = max(mpre[i], mpre[i + 1])
+    inds = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[inds + 1] - mrec[inds]) * mpre[inds + 1]))
+
+
+def make_edge_bins(values, edges, name):
+    values = np.array([value for value in values if np.isfinite(value)], dtype=np.float32)
+    if not edges:
+        if values.size == 0:
+            return []
+        edges = np.percentile(values, [33.333, 66.667]).tolist()
+    edges = sorted(edges)
+    bins = []
+    prev = None
+    for edge in edges:
+        if prev is None:
+            bins.append(('%s<%g' % (name, edge),
+                         lambda target, edge=edge: np.isfinite(target[name]) and target[name] < edge))
+        else:
+            bins.append(('%g<=%s<%g' % (prev, name, edge),
+                         lambda target, prev=prev, edge=edge: np.isfinite(target[name]) and prev <= target[name] < edge))
+        prev = edge
+    bins.append(('%s>=%g' % (name, edges[-1]),
+                 lambda target, edge=edges[-1]: np.isfinite(target[name]) and target[name] >= edge))
+    return bins
+
+
+def build_target_records(coco_gt, mot_json, exclude_videos=None):
+    exclude_videos = set(exclude_videos or [])
+    image_by_id = {int(img['id']): img for img in coco_gt.dataset['images']}
+    video_name_by_img = {image_id: image_video_name(img) for image_id, img in image_by_id.items()}
+
+    with open(mot_json, 'r') as f:
+        mot = json.load(f)
+    frame_by_img = {int(i['id']): int(i['frame_id']) for i in mot['images']}
+    video_id_by_img = {int(i['id']): int(i['video_id']) for i in mot['images']}
+
+    targets_by_img = defaultdict(list)
+    tracks = defaultdict(list)
+    target_id = 0
+    for ann in mot['annotations']:
+        image_id = int(ann['image_id'])
+        if image_id not in image_by_id:
+            continue
+        video_name = video_name_by_img[image_id]
+        if video_name in exclude_videos:
+            continue
+        x, y, w, h = ann['bbox']
+        cx, cy = x + w / 2.0, y + h / 2.0
+        target = {
+            'target_id': target_id,
+            'image_id': image_id,
+            'video_name': video_name,
+            'video_id': video_id_by_img[image_id],
+            'frame_id': frame_by_img[image_id],
+            'track_id': int(ann['track_id']),
+            'box': np.array([x, y, x + w, y + h], dtype=np.float32),
+            'sqrt_area': float(np.sqrt(max(w * h, 0))),
+            'track_disp': np.nan,
+            'local_disp': np.nan,
+            'cx': float(cx),
+            'cy': float(cy),
+        }
+        target_id += 1
+        targets_by_img[image_id].append(target)
+        tracks[(target['video_id'], target['track_id'])].append(target)
+
+    for track in tracks.values():
+        track = sorted(track, key=lambda item: item['frame_id'])
+        track_disp_values = []
+        for prev, cur in zip(track[:-1], track[1:]):
+            gap = cur['frame_id'] - prev['frame_id']
+            if gap > 0:
+                track_disp_values.append(np.hypot(cur['cx'] - prev['cx'], cur['cy'] - prev['cy']) / gap)
+        track_disp = float(np.nanmean(track_disp_values)) if track_disp_values else np.nan
+        for idx, target in enumerate(track):
+            local_disp_values = []
+            if idx > 0:
+                prev = track[idx - 1]
+                gap = target['frame_id'] - prev['frame_id']
+                if gap > 0:
+                    local_disp_values.append(np.hypot(target['cx'] - prev['cx'], target['cy'] - prev['cy']) / gap)
+            if idx + 1 < len(track):
+                nxt = track[idx + 1]
+                gap = nxt['frame_id'] - target['frame_id']
+                if gap > 0:
+                    local_disp_values.append(np.hypot(nxt['cx'] - target['cx'], nxt['cy'] - target['cy']) / gap)
+            target['track_disp'] = track_disp
+            target['local_disp'] = float(np.nanmean(local_disp_values)) if local_disp_values else np.nan
+
+    targets = []
+    for image_id in targets_by_img:
+        targets_by_img[image_id] = sorted(targets_by_img[image_id], key=lambda item: item['target_id'])
+        targets.extend(targets_by_img[image_id])
+    return targets_by_img, targets, video_name_by_img
+
+
+def match_detection_records(pred_json, targets_by_img, valid_img_ids, iou_th=0.5):
+    valid_img_ids = set(valid_img_ids)
+    with open(pred_json, 'r') as f:
+        detections = json.load(f)
+
+    dets_by_img = defaultdict(list)
+    for det in detections:
+        image_id = int(det['image_id'])
+        if image_id not in valid_img_ids:
+            continue
+        box = np.array(xywh_to_xyxy(det['bbox']), dtype=np.float32)
+        score = float(det['score'])
+        if score > 0 and box[2] > box[0] and box[3] > box[1]:
+            dets_by_img[image_id].append((score, box))
+    for image_id in dets_by_img:
+        dets_by_img[image_id].sort(key=lambda item: -item[0])
+
+    records = []
+    matched_by_img = defaultdict(set)
+    for image_id in sorted(valid_img_ids):
+        targets = targets_by_img.get(image_id, [])
+        boxes = np.array([target['box'] for target in targets], dtype=np.float32).reshape(-1, 4)
+        target_ids = [target['target_id'] for target in targets]
+        for score, box in dets_by_img.get(image_id, []):
+            best_target_id = None
+            best_iou = 0.0
+            matched_target_id = None
+            if boxes.shape[0] > 0:
+                overlaps = bbox_iou_one_to_many(box, boxes)
+                best_idx = int(np.argmax(overlaps))
+                best_iou = float(overlaps[best_idx])
+                best_target_id = target_ids[best_idx]
+                if best_iou >= iou_th and best_target_id not in matched_by_img[image_id]:
+                    matched_target_id = best_target_id
+                    matched_by_img[image_id].add(best_target_id)
+            records.append({
+                'score': score,
+                'matched_target_id': matched_target_id,
+                'best_target_id': best_target_id,
+                'best_iou': best_iou,
+            })
+    records.sort(key=lambda item: -item['score'])
+    return records
+
+
+def eval_target_bucket(records, selected_target_ids, iou_th=0.5):
+    selected_target_ids = set(selected_target_ids)
+    npos = len(selected_target_ids)
+    if npos == 0:
+        return {'ap50': np.nan, 'ar50': np.nan, 'tp': 0, 'fp': 0, 'n_gt': 0}
+
+    tp, fp = [], []
+    for record in records:
+        if record['matched_target_id'] in selected_target_ids:
+            tp.append(1.0)
+            fp.append(0.0)
+        elif record['best_iou'] >= iou_th and record['best_target_id'] not in selected_target_ids:
+            continue
+        else:
+            tp.append(0.0)
+            fp.append(1.0)
+    tp = np.array(tp, dtype=np.float32)
+    fp = np.array(fp, dtype=np.float32)
+    if tp.size == 0:
+        return {'ap50': 0.0, 'ar50': 0.0, 'tp': 0, 'fp': 0, 'n_gt': npos}
+    tp_cum = np.cumsum(tp)
+    fp_cum = np.cumsum(fp)
+    rec = tp_cum / npos
+    prec = tp_cum / np.maximum(tp_cum + fp_cum, 1e-12)
+    return {
+        'ap50': voc_ap(rec, prec),
+        'ar50': float(tp_cum[-1] / npos),
+        'tp': int(tp_cum[-1]),
+        'fp': int(fp_cum[-1]),
+        'n_gt': npos,
+    }
+
+
+def run_target_ap_buckets(coco_gt, pred_json, mot_json, eval_splits, disp_bins, size_bins,
+                          save_dir, exclude_videos=None, iou_th=0.5, attrs=None):
+    targets_by_img, targets, video_name_by_img = build_target_records(coco_gt, mot_json, exclude_videos)
+    split_img_ids = get_split_img_ids(coco_gt, eval_splits, exclude_videos)
+    records = match_detection_records(pred_json, targets_by_img, video_name_by_img.keys(), iou_th)
+    attrs = set(attrs or ['size', 'track_disp', 'local_disp'])
+
+    attr_bins = []
+    if 'size' in attrs:
+        attr_bins.extend(('size', label, select)
+                         for label, select in make_edge_bins([t['sqrt_area'] for t in targets], size_bins, 'sqrt_area'))
+    if 'track_disp' in attrs:
+        attr_bins.extend(('track_disp', label, select)
+                         for label, select in make_edge_bins([t['track_disp'] for t in targets], disp_bins, 'track_disp'))
+    if 'local_disp' in attrs:
+        attr_bins.extend(('local_disp', label, select)
+                         for label, select in make_edge_bins([t['local_disp'] for t in targets], disp_bins, 'local_disp'))
+
+    rows = []
+    print('\n========== Target-level AP50 buckets ==========', flush=True)
+    print('%-11s %-12s %-24s %-8s %-8s %-8s %-10s' % (
+        'split', 'attr', 'bucket', 'n_gt', 'ap50', 'ar50', 'tp/fp'), flush=True)
+    for split_name in eval_splits:
+        split_img_set = set(split_img_ids[split_name])
+        split_targets = [target for target in targets if target['image_id'] in split_img_set]
+        for attr_name, bucket_name, select in attr_bins:
+            selected = [target['target_id'] for target in split_targets if select(target)]
+            result = eval_target_bucket(records, selected, iou_th)
+            print('%-11s %-12s %-24s %-8d %-8s %-8s %d/%d' % (
+                split_name, attr_name, bucket_name, result['n_gt'],
+                'NA' if not np.isfinite(result['ap50']) else '%.2f' % (result['ap50'] * 100),
+                'NA' if not np.isfinite(result['ar50']) else '%.2f' % (result['ar50'] * 100),
+                result['tp'], result['fp']), flush=True)
+            rows.append((split_name, attr_name, bucket_name, result))
+
+    path = os.path.join(save_dir, 'target_ap50_bucket_results.txt')
+    with open(path, 'w') as f:
+        f.write('pred_json=%s\n' % pred_json)
+        f.write('mot_json=%s\niou_th=%.2f\n' % (mot_json, iou_th))
+        f.write('split\tattr\tbucket\tn_gt\tap50\tar50\ttp\tfp\n')
+        for split_name, attr_name, bucket_name, result in rows:
+            f.write('%s\t%s\t%s\t%d\t%.5f\t%.5f\t%d\t%d\n' % (
+                split_name, attr_name, bucket_name, result['n_gt'], result['ap50'], result['ar50'],
+                result['tp'], result['fp']))
+    print('\ntarget-level AP50 bucket results saved to: %s' % path)
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Evaluate prediction COCO json with COCOeval and F1 metrics.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--pred_json', default='/root/autodl-tmp/SGNet/weights/aircraft_multi/UNet3D/UNet3D_163264128_snack111555_wobn_L5_womask_seglen10_2026_08_09_18_34_18/results_model_best_ap50/results_model_best_ap50.json')
+    parser.add_argument('--pred_json', default='/root/autodl-tmp/SGNet/weights/aircraft_multi/UNet3D/0813re1UNet3D_Snack511511_L3_TMixer_GL_seglen10_2026_08_14_02_56_52/results_model_best_ap50/results_model_best_ap50.json')
     parser.add_argument('--gt_json', default='/root/autodl-tmp/AircraftDataset27/annotations/annotations_test_new.json')
     parser.add_argument('--save_dir', default=None, help='directory to save metric txt files; None means eval_<pred_json_stem> beside pred_json')
     parser.add_argument('--eval_splits', default='all,real,sim', help='comma list: all,real,sim')
     parser.add_argument('--f1_mode', default='iou', help='comma list: iou,dis')
-    parser.add_argument('--exclude_videos', default='realobject_1083_2_2_5_10')
-    parser.add_argument('--conf_ths', default='0.2,0.25,0.3,0.35,0.4', help='comma separated confidence thresholds')
+    parser.add_argument('--exclude_videos', default='')
+    parser.add_argument('--conf_ths', default='0.25,0.3', help='comma separated confidence thresholds')
     parser.add_argument('--no_coco', action='store_true', default=False, help='skip COCOeval metrics')
     parser.add_argument('--run_video_coco', action='store_true', default=False, help='run COCOeval for each video and print compact percentage table')
     parser.add_argument('--no_f1', action='store_true', default=True, help='skip F1 metrics')
     parser.add_argument('--mot_json', default='/root/autodl-tmp/AircraftDataset27/annotations/test_mot_new.json',
                         help='MOT json with track ids, bbox consistent with gt_json; used only for --disp_bins')
-    parser.add_argument('--disp_bins', default='5,10,20', help='comma list of per-frame displacement bin edges (px), e.g. 5,10,20; empty disables per-track displacement classification')
+    parser.add_argument('--disp_bins', default='', help='comma list of per-frame displacement bin edges (px), e.g. 5,10,20; empty disables per-track displacement classification')
     parser.add_argument('--fp_attr', default='none', choices=['none', 'nearest'],
                         help="how to attribute false positives to displacement categories; 'nearest'=assign to nearest gt box category (approximate precision/F1)")
+    parser.add_argument('--run_target_ap', action='store_true', default=True,
+                        help='run target-level AP50/AR50 buckets by object size and displacement')
+    parser.add_argument('--target_ap_attrs', default='size,track_disp,local_disp',
+                        help='comma list: size,track_disp,local_disp')
+    parser.add_argument('--size_bins', default='8,16,32',
+                        help='sqrt(area) bin edges in pixels; empty uses target tertiles')
+    parser.add_argument('--target_iou_th', type=float, default=0.5,
+                        help='IoU threshold for target-level AP buckets')
+    parser.add_argument('--target_disp_bins', default='5,10,20',
+                        help='target-level displacement bin edges; empty reuses --disp_bins, and if both are empty uses tertiles')
     args = parser.parse_args()
 
     save_dir = args.save_dir
@@ -442,6 +706,11 @@ def main():
     if disp_bins:
         run_json_f1_disp(coco_gt, args.pred_json, args.gt_json, args.mot_json, disp_bins,
                          eval_splits, f1_modes, conf_ths, save_dir, exclude_videos, args.fp_attr)
+    if args.run_target_ap:
+        target_disp_bins = parse_float_list(args.target_disp_bins) if args.target_disp_bins else disp_bins
+        run_target_ap_buckets(coco_gt, args.pred_json, args.mot_json, eval_splits,
+                              target_disp_bins, parse_float_list(args.size_bins), save_dir,
+                              exclude_videos, args.target_iou_th, parse_str_list(args.target_ap_attrs))
 
     print('\nresults saved to: %s' % save_dir)
 

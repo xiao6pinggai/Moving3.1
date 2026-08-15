@@ -104,6 +104,7 @@ class DeformConvNd(nn.Module):
         offset_bias: bool = True,
         mask_bias: bool = True,
         auto_offset: bool = True,
+        offset_kernel_size: Optional[_Size] = None,
         device=None,
         dtype=None,
     ) -> None:
@@ -148,6 +149,12 @@ class DeformConvNd(nn.Module):
         self.modulated = modulated
         self.mask_groups = mask_groups
         self.auto_offset = auto_offset
+        if offset_kernel_size is None:
+            self.offset_kernel_size = self.kernel_size
+            self.offset_padding = self.padding
+        else:
+            self.offset_kernel_size = _as_tuple(offset_kernel_size, ndim)
+            self.offset_padding = _same_padding(self.offset_kernel_size, self.dilation)
 
         # 主卷积权重，形状与标准 ConvNd 一致。
         weight_shape = (out_channels, in_channels // groups, *self.kernel_size)
@@ -166,9 +173,9 @@ class DeformConvNd(nn.Module):
             self.offset_generator = conv(
                 in_channels,
                 offset_channels,
-                kernel_size=self.kernel_size,
+                kernel_size=self.offset_kernel_size,
                 stride=self.stride,
-                padding=self.padding,
+                padding=self.offset_padding,
                 dilation=self.dilation,
                 groups=offset_groups,
                 bias=offset_bias,
@@ -382,6 +389,7 @@ class SnakeDeformConv3d(DeformConv3d):
         in_channels: int,
         out_channels: int,
         kernel_size: _Size,
+        offset_kernel_size: Optional[_Size] = None,
         stride: _Size = 1,
         padding: Union[str, _Size] = 0,
         dilation: _Size = 1,
@@ -431,6 +439,14 @@ class SnakeDeformConv3d(DeformConv3d):
             raise ValueError("out_channels must be divisible by mask_groups")
 
         factory_kwargs = {"device": device, "dtype": dtype}
+        if offset_kernel_size is None:
+            self.offset_kernel_size = self.kernel_size
+            self.offset_padding = self.padding
+        else:
+            self.offset_kernel_size = _triple(offset_kernel_size)
+            self.offset_padding = _same_padding(self.offset_kernel_size, self.dilation)
+
+        factory_kwargs = {"device": device, "dtype": dtype}
         temporal_kernel = self.kernel_size[0]
         offset_channels = 2 * offset_groups * temporal_kernel
         self.offset_generator = nn.Conv3d(
@@ -444,7 +460,18 @@ class SnakeDeformConv3d(DeformConv3d):
             bias=offset_bias,
             **factory_kwargs,
         )
-        # self.offset_norm = nn.BatchNorm3d(offset_channels, **factory_kwargs)
+        # self.offset_generator = nn.Conv3d(
+        #             in_channels,
+        #             offset_channels,
+        #             kernel_size=3, # 保证5*5*5卷积核
+        #             stride=1,
+        #             padding=1,
+        #             dilation=self.dilation,
+        #             groups=offset_groups,
+        #             bias=offset_bias,
+        #             **factory_kwargs,
+        #         )
+        self.offset_norm = nn.BatchNorm3d(offset_channels, **factory_kwargs)
 
         self.modulated = modulated
         self.mask_groups = mask_groups
@@ -491,8 +518,8 @@ class SnakeDeformConv3d(DeformConv3d):
 
     def _make_temporal_snake_offset(self, x: Tensor) -> Tensor:
         raw_offset = self.offset_generator(x)
-        # raw_offset = torch.tanh(self.offset_norm(raw_offset)) * self.extend_scope # 这里不符合DCN的默认设置，默认是直接传回raw而不做任何约束
-        raw_offset = torch.tanh(raw_offset) * self.extend_scope # 这里不符合DCN的默认设置，默认是直接传回raw而不做任何约束
+        raw_offset = torch.tanh(self.offset_norm(raw_offset)) * self.extend_scope # 这里不符合DCN的默认设置，默认是直接传回raw而不做任何约束
+        # raw_offset = torch.tanh(raw_offset) * self.extend_scope # 这里不符合DCN的默认设置，默认是直接传回raw而不做任何约束
 
         n, _, out_d, out_h, out_w = raw_offset.shape
         temporal_kernel = self.kernel_size[0]
@@ -555,7 +582,434 @@ class SnakeDeformConv3d(DeformConv3d):
         return ", ".join(field for field in fields if field)
 
 
+class SnakeUnrestDeformConv3d(DeformConv3d):
+        
+    """Temporal dynamic snake deformable convolution for N,C,D,H,W tensors.
+
+    中文说明：
+    - 该层只实现时域蛇形约束，要求 kernel_size=(k,1,1)，其中 D 维对应时间 T。
+    - 时间轴位置由标准 Conv3d 的 D 方向核位置给出；可学习偏移只作用在 H,W
+      两个正交方向，并按 DSConv 的中心向两侧递推公式累积。
+    - raw offset不做处理。
+    - 输出 offset 会被组装成 tvdcn deform_conv3d 需要的
+      N, 3 * offset_groups * k, out_d, out_h, out_w 格式，其中 dz 恒为 0。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: _Size,
+        offset_kernel_size: Optional[_Size] = None,
+        stride: _Size = 1,
+        padding: Union[str, _Size] = 0,
+        dilation: _Size = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        offset_groups: int = 1,
+        modulated: bool = False,
+        mask_groups: int = 1,
+        offset_bias: bool = True,
+        mask_bias: bool = True,
+        extend_scope: float = 1.0,
+        mask_scale: float = 2.0,
+        device=None,
+        dtype=None,
+    ) -> None:
+        kernel_size_ = _triple(kernel_size)
+        if kernel_size_[1:] != (1, 1):
+            raise ValueError("SnakeDeformConv3d only supports temporal kernels: kernel_size=(k, 1, 1)")
+        if kernel_size_[0] % 2 == 0:
+            raise ValueError("SnakeDeformConv3d requires an odd temporal kernel size")
+        if extend_scope <= 0:
+            raise ValueError("extend_scope must be positive")
+        if mask_scale <= 0:
+            raise ValueError("mask_scale must be positive")
+
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size_,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            offset_groups=offset_groups,
+            modulated=False,
+            auto_offset=False,
+            device=device,
+            dtype=dtype,
+        )
+
+        if in_channels % mask_groups != 0:
+            raise ValueError("in_channels must be divisible by mask_groups")
+        if out_channels % mask_groups != 0:
+            raise ValueError("out_channels must be divisible by mask_groups")
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        if offset_kernel_size is None:
+            self.offset_kernel_size = self.kernel_size
+            self.offset_padding = self.padding
+        else:
+            self.offset_kernel_size = _triple(offset_kernel_size)
+            self.offset_padding = _same_padding(self.offset_kernel_size, self.dilation)
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        temporal_kernel = self.kernel_size[0]
+        offset_channels = 2 * offset_groups * temporal_kernel
+        self.offset_generator = nn.Conv3d(
+            in_channels,
+            offset_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=offset_groups,
+            bias=offset_bias,
+            **factory_kwargs,
+        )
+
+        self.modulated = modulated
+        self.mask_groups = mask_groups
+        self.extend_scope = float(extend_scope)
+        self.mask_scale = float(mask_scale)
+        self.auto_offset = True
+
+        if modulated:
+            self.mask_generator = nn.Conv3d(
+                in_channels,
+                mask_groups * temporal_kernel,
+                kernel_size=self.kernel_size,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=mask_groups,
+                bias=mask_bias,
+                **factory_kwargs,
+            )
+        else:
+            self.mask_generator = None
+
+        self.reset_parameters()
+
+    @staticmethod
+    def _accumulate_from_center(delta: Tensor) -> Tensor:
+        center = delta.size(2) // 2
+        zero = torch.zeros_like(delta[:, :, center])
+
+        lower_offsets = []
+        acc = zero
+        for step in range(1, center + 1):
+            acc = acc + delta[:, :, center - step]
+            lower_offsets.append(acc)
+        lower_offsets.reverse()
+
+        upper_offsets = [zero]
+        acc = zero
+        for step in range(1, center + 1):
+            acc = acc + delta[:, :, center + step]
+            upper_offsets.append(acc)
+
+        return torch.stack(lower_offsets + upper_offsets, dim=2)
+
+    def _make_temporal_snake_offset(self, x: Tensor) -> Tensor:
+        raw_offset = self.offset_generator(x)
+
+        n, _, out_d, out_h, out_w = raw_offset.shape
+        temporal_kernel = self.kernel_size[0]
+        raw_offset = raw_offset.view(
+            n,
+            self.offset_groups,
+            temporal_kernel,
+            2,
+            out_d,
+            out_h,
+            out_w,
+        )
+
+        delta_h = raw_offset[:, :, :, 0]
+        delta_w = raw_offset[:, :, :, 1]
+        snake_h = self._accumulate_from_center(delta_h)
+        snake_w = self._accumulate_from_center(delta_w)
+
+        offset = raw_offset.new_zeros(
+            n,
+            self.offset_groups,
+            temporal_kernel,
+            1,
+            1,
+            3,
+            out_d,
+            out_h,
+            out_w,
+        )
+        offset[:, :, :, 0, 0, 1] = snake_h
+        offset[:, :, :, 0, 0, 2] = snake_w
+        return offset.reshape(n, 3 * self.offset_groups * temporal_kernel, out_d, out_h, out_w)
+
+    def reset_parameters(self) -> None:
+        super().reset_parameters()
+        if self.offset_generator is not None:
+            nn.init.zeros_(self.offset_generator.weight)
+            if self.offset_generator.bias is not None:
+                nn.init.zeros_(self.offset_generator.bias)
+        if hasattr(self, "offset_norm"):
+            nn.init.ones_(self.offset_norm.weight)
+            nn.init.zeros_(self.offset_norm.bias)
+        if self.mask_generator is not None:
+            nn.init.zeros_(self.mask_generator.weight)
+            if self.mask_generator.bias is not None:
+                nn.init.zeros_(self.mask_generator.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        offset = self._make_temporal_snake_offset(x)
+        if self.mask_generator is not None:
+            mask = torch.sigmoid(self.mask_generator(x)) * self.mask_scale
+        else:
+            mask = None
+        return super().forward(x, offset=offset, mask=mask)
+
+    def extra_repr(self) -> str:
+        fields = [super().extra_repr(), f"extend_scope={self.extend_scope}"]
+        if self.mask_scale != 2.0:
+            fields.append(f"mask_scale={self.mask_scale}")
+        return ", ".join(field for field in fields if field)
+
+
+class VelocitySnakeDeformConv3d(DeformConv3d):
+    """Temporal snake DCN with a shared constant-velocity motion prior.
+
+    For each offset group, the offset generator predicts a 2-D velocity and
+    unconstrained 2-D residual increments. The velocity provides the common
+    linear trajectory, while residuals use the center-outward snake rule.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: _Size,
+        offset_kernel_size: Optional[_Size] = None,
+        stride: _Size = 1,
+        padding: Union[str, _Size] = 0,
+        dilation: _Size = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        offset_groups: int = 1,
+        modulated: bool = False,
+        mask_groups: int = 1,
+        offset_bias: bool = True,
+        mask_bias: bool = True,
+        extend_scope: float = 1.0,
+        mask_scale: float = 2.0,
+        use_residual: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        kernel_size_ = _triple(kernel_size)
+        if kernel_size_[1:] != (1, 1):
+            raise ValueError("VelocitySnakeDeformConv3d only supports temporal kernels: kernel_size=(k, 1, 1)")
+        if kernel_size_[0] % 2 == 0:
+            raise ValueError("VelocitySnakeDeformConv3d requires an odd temporal kernel size")
+        if extend_scope <= 0:
+            raise ValueError("extend_scope must be positive")
+        if mask_scale <= 0:
+            raise ValueError("mask_scale must be positive")
+
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size_,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            offset_groups=offset_groups,
+            modulated=False,
+            auto_offset=False,
+            device=device,
+            dtype=dtype,
+        )
+
+        if in_channels % mask_groups != 0:
+            raise ValueError("in_channels must be divisible by mask_groups")
+        if out_channels % mask_groups != 0:
+            raise ValueError("out_channels must be divisible by mask_groups")
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        if offset_kernel_size is None:
+            self.offset_kernel_size = self.kernel_size
+            self.offset_padding = self.padding
+        else:
+            self.offset_kernel_size = _triple(offset_kernel_size)
+            self.offset_padding = _same_padding(self.offset_kernel_size, self.dilation)
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        temporal_kernel = self.kernel_size[0]
+        offset_channels = 2 * offset_groups * temporal_kernel
+        self.offset_generator = nn.Conv3d(
+            in_channels,
+            offset_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=offset_groups,
+            bias=offset_bias,
+            **factory_kwargs,
+        )
+        self.velocity_norm = nn.BatchNorm3d(2 * offset_groups, **factory_kwargs)
+
+        self.modulated = modulated
+        self.mask_groups = mask_groups
+        self.extend_scope = float(extend_scope)
+        self.mask_scale = float(mask_scale)
+        self.use_residual = bool(use_residual)
+        self.auto_offset = True
+
+        if modulated:
+            self.mask_generator = nn.Conv3d(
+                in_channels,
+                mask_groups * temporal_kernel,
+                kernel_size=self.kernel_size,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=mask_groups,
+                bias=mask_bias,
+                **factory_kwargs,
+            )
+        else:
+            self.mask_generator = None
+
+        self.reset_parameters()
+
+    @staticmethod
+    def _accumulate_from_center(delta: Tensor) -> Tensor:
+        center = delta.size(2) // 2
+        zero = torch.zeros_like(delta[:, :, center])
+
+        lower_offsets = []
+        acc = zero
+        for step in range(1, center + 1):
+            acc = acc + delta[:, :, center - step]
+            lower_offsets.append(acc)
+        lower_offsets.reverse()
+
+        upper_offsets = [zero]
+        acc = zero
+        for step in range(1, center + 1):
+            acc = acc + delta[:, :, center + step]
+            upper_offsets.append(acc)
+
+        return torch.stack(lower_offsets + upper_offsets, dim=2)
+
+    def _make_temporal_snake_offset(self, x: Tensor) -> Tensor:
+        raw_offset = self.offset_generator(x)
+        n, _, out_d, out_h, out_w = raw_offset.shape
+        temporal_kernel = self.kernel_size[0]
+        center = temporal_kernel // 2
+
+        raw_offset = raw_offset.view(
+            n,
+            self.offset_groups,
+            2 + 2 * (temporal_kernel - 1),
+            out_d,
+            out_h,
+            out_w,
+        )
+        raw_velocity = raw_offset[:, :, :2]
+        raw_velocity = raw_velocity.reshape(n, 2 * self.offset_groups, out_d, out_h, out_w)
+        velocity = torch.tanh(self.velocity_norm(raw_velocity)) * self.extend_scope
+        velocity = velocity.view(n, self.offset_groups, 2, out_d, out_h, out_w)
+        residual = None
+        if self.use_residual:
+            residual = raw_offset[:, :, 2:].view(
+                n,
+                self.offset_groups,
+                temporal_kernel - 1,
+                2,
+                out_d,
+                out_h,
+                out_w,
+            )
+
+        delta = raw_offset.new_zeros(
+            n,
+            self.offset_groups,
+            temporal_kernel,
+            2,
+            out_d,
+            out_h,
+            out_w,
+        )
+        residual_index = 0
+        for index in range(temporal_kernel):
+            if index == center:
+                continue
+            direction = -1.0 if index < center else 1.0
+            delta[:, :, index] = direction * velocity
+            if residual is not None:
+                delta[:, :, index] = delta[:, :, index] + residual[:, :, residual_index]
+            residual_index += 1
+
+        snake_h = self._accumulate_from_center(delta[:, :, :, 0])
+        snake_w = self._accumulate_from_center(delta[:, :, :, 1])
+
+        offset = raw_offset.new_zeros(
+            n,
+            self.offset_groups,
+            temporal_kernel,
+            1,
+            1,
+            3,
+            out_d,
+            out_h,
+            out_w,
+        )
+        offset[:, :, :, 0, 0, 1] = snake_h
+        offset[:, :, :, 0, 0, 2] = snake_w
+        return offset.reshape(n, 3 * self.offset_groups * temporal_kernel, out_d, out_h, out_w)
+
+    def reset_parameters(self) -> None:
+        super().reset_parameters()
+        if hasattr(self, "offset_generator") and self.offset_generator is not None:
+            nn.init.zeros_(self.offset_generator.weight)
+            if self.offset_generator.bias is not None:
+                nn.init.zeros_(self.offset_generator.bias)
+        if hasattr(self, "velocity_norm"):
+            nn.init.ones_(self.velocity_norm.weight)
+            nn.init.zeros_(self.velocity_norm.bias)
+        if hasattr(self, "mask_generator") and self.mask_generator is not None:
+            nn.init.zeros_(self.mask_generator.weight)
+            if self.mask_generator.bias is not None:
+                nn.init.zeros_(self.mask_generator.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        offset = self._make_temporal_snake_offset(x)
+        if self.mask_generator is not None:
+            mask = torch.sigmoid(self.mask_generator(x)) * self.mask_scale
+        else:
+            mask = None
+        return super().forward(x, offset=offset, mask=mask)
+
+    def extra_repr(self) -> str:
+        fields = [super().extra_repr(), f"extend_scope={self.extend_scope}"]
+        if self.mask_scale != 2.0:
+            fields.append(f"mask_scale={self.mask_scale}")
+        if not self.use_residual:
+            fields.append("use_residual=False")
+        return ", ".join(field for field in fields if field)
+
+
 DCN1d = DeformConv1d
 DCN2d = DeformConv2d
 DCN3d = DeformConv3d
 SnakeDCN3d = SnakeDeformConv3d
+VelocitySnakeDCN3d = VelocitySnakeDeformConv3d

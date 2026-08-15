@@ -268,3 +268,240 @@ python train.py \
   --Snack_max_offset '[7,7,7]' \
   --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
  
+python train.py \
+  --discribe UNet3D_163264128_rebaseline1 \
+  --exp_name UNet3D_163264128_rebaseline1 \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[0,0,0]' \
+  --TZSConv_skip '[0,0,0]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+python train.py \
+  --discribe UNet3D_163264128_rebaseline2 \
+  --exp_name UNet3D_163264128_rebaseline2 \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[0,0,0]' \
+  --TZSConv_skip '[0,0,0]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+python train.py \
+  --discribe UNet3D_163264128_rebaseline3 \
+  --exp_name UNet3D_163264128_rebaseline3\
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[0,0,0]' \
+  --TZSConv_skip '[0,0,0]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+python train.py \
+  --discribe UNet3D_163264128_rebaseline4 \
+  --exp_name UNet3D_163264128_rebaseline4 \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[0,0,0]' \
+  --TZSConv_skip '[0,0,0]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+python train.py \
+  --discribe UNet3D_163264128_rebaseline5 \
+  --exp_name UNet3D_163264128_rebaseline5 \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[0,0,0]' \
+  --TZSConv_skip '[0,0,0]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+
+
+python train.py \
+  --discribe UNet3D_snack111555_L7_squareog_wbntanhscope \
+  --exp_name UNet3D_snack111555_L7_squareog_wbntanhscope \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'snack' \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[7,7,7]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+python train.py \
+  --discribe UNet3D_snack111555_L5_squareog_wbntanhscope \
+  --exp_name UNet3D_snack111555_L5_squareog_wbntanhscope \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'snack' \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[5,5,5]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+ 
+python train.py \
+  --discribe UNet3D_snack111555_L5_333og_wbntanhscope \
+  --exp_name UNet3D_snack111555_L5_333og_wbntanhscope \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'snack' \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[5,5,5]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+ 
+python train.py \
+  --discribe UNet3D_snack111555_L5_back511_wbntanhscope \
+  --exp_name UNet3D_snack111555_L5_back511_wbntanhscope \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'snack' \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[5,5,5]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+ 
+python train.py \
+  --discribe UNet3D_vsnack111555_L5_wbntanh_vscope \
+  --exp_name UNet3D_vsnack111555_L5_wbntanh_vscope \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'v_snack' \
+  --VSnack_residual 0 \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[5,5,5]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+ python test.py \
+  --datasetname aircraft \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_mode": ["iou"]}' \
+  --load_model /root/autodl-tmp/SGNet/weights/aircraft_multi/UNet3D/UNet3D_snack111555_L5_back511_wbntanhscope_seglen10_2026_08_10_13_47_48/model_best_ap50.pth \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --UNet3D_skip 'snack' \
+  --Snack_skip '[1,1,1]' \
+  --TZSConv_skip '[0,0,0]'\
+  --Snack_max_offset '[5,5,5]' 
+
+python train.py \
+  --discribe UNet3D_snack111_L5_back511_wbntanhscope \
+  --exp_name UNet3D_snack111_L5_back511_wbntanhscope \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'snack' \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[5,5,5]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+ 
+python train.py \
+  --discribe UNet3D_snack_unrest111311 \
+  --exp_name UNet3D_snack_unrest111311 \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --UNet3D_skip 'snack_unrest' \
+  --TZSConv_skip '[0,0,0]' \
+  --Snack_max_offset '[5,5,5]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+python train.py \
+  --discribe UNet3D_snack_unrest111311 \
+  --exp_name UNet3D_snack_unrest111311 \
+  --datasetname aircraft \
+  --load_model "" \
+  --resume True \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --feat_channels '[16,32,64,128]' \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --Snack_skip '[1,1,1]' \
+  --TKernel '[[3,1,1],[3,1,1],[3,1,1]]' \
+  --UNet3D_skip 'snack_unrest' \
+  --TZSConv_skip '[0,0,0]' \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_source": "json", "f1_mode": ["iou"], "eval_splits": ["all", "real", "sim"], "best_metric": "ap50"}'
+
+ python test.py \
+  --datasetname aircraft \
+  --metric '{"inference": true, "run_ap": true, "run_f1": true, "save_json": true, "save_mat": false, "f1_mode": ["iou"]}' \
+  --load_model /root/autodl-tmp/SGNet/weights/aircraft_multi/UNet3D/UNet3D_tdcn111555_seglen10_2026_08_06_18_27_23/model_best_ap50.pth \
+  --model_name UNet3D \
+  --seqLen 10 \
+  --UNet3D_skip 'tdcn' \
+  --Snack_skip '[1,1,1]' \
+  --TZSConv_skip '[0,0,0]'\
+  --Snack_max_offset '[5,5,5]' \
+  --TKernel '[[5,1,1],[5,1,1],[5,1,1]]' \
+  --OffsetKernel '[[5,1,1],[5,1,1],[5,1,1]]' 

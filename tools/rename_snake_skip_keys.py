@@ -20,7 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Rename old UNet3D snake skip checkpoint keys to current skip keys."
     )
-    parser.add_argument("--pth", default="/root/autodl-tmp/SGNet/weights/aircraft_multi/UNet3D/UNet3D_163264128_snack111555_womask_seglen10_2026_08_05_22_34_00/model_best_ap50.pth", help="input .pth checkpoint path")
+    parser.add_argument("--pth", default="//root/autodl-tmp/SGNet/weights/aircraft_multi/UNet3D/UNet3D_tdcn111555_seglen10_2026_08_06_18_27_23/model_best_ap50.pth", help="input .pth checkpoint path")
     parser.add_argument(
         "-o",
         "--output",
